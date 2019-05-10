@@ -1,5 +1,5 @@
 <h1>Flink入门</h1>
-<h2><a href="./readme.md">Flink是做什么的</a></h2>
+<h2><a href="./README.md">Flink是做什么的</a></h2>
 <h2>Flink的关键特点</h2>
 <h2>Flink的安装部署</h2>
 <h3>单机部署</h3>
