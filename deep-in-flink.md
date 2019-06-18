@@ -1,8 +1,7 @@
 ---
 
 
-typora-copy-images-to: images
-typora-root-url: ./
+
 ---
 
 **<font size=20 textAlign ="center">Deep In Flink</font>**
@@ -961,7 +960,7 @@ Marker sending rule for process Pi`
 
 
 
-## End-to-End Exactly Once
+### End-to-End Exactly Once
 
 Flink通过**两阶段提交协议**实现了Source->计算->Sink整个过程的端到端Exactly Once，无论是什么原因导致的Job失败，都保证数据严格读取、处理、写入一次。
 
@@ -975,7 +974,7 @@ Flink通过**两阶段提交协议**实现了Source->计算->Sink整个过程的
 
 
 
-### 两阶段提交协议
+#### 两阶段提交协议
 
 
 
@@ -2366,7 +2365,7 @@ private List<StreamEdge> createChain(
 
 #### 关键对象
 
-####  OperatorChain
+#####  OperatorChain
 
 为了更高效地分布式执行，Flink会尽可能地将operator的subtask链接（chain）在一起形成task。每个task在一个线程中执行。将operators链接成task是非常有效的优化：它能减少线程之间的切换，减少消息的序列化/反序列化，减少数据在缓冲区的交换，减少了延迟的同时提高整体的吞吐量。
 
@@ -2374,7 +2373,9 @@ private List<StreamEdge> createChain(
 
 ![1560394979197](/images/1560394979197.png)
 
-`isChainable()`，用来判断`StreamNode chain`，一共有`9`个条件：
+**可以Chain的条件**
+
+isChainable()`，用来判断`是否可以将StreamOperator chain`在一起，一共有`9`个条件：
 
 - 下游节点的入边为`1` 
 -  `StreamEdge`的下游节点对应的算子不为`null` 
@@ -2385,6 +2386,59 @@ private List<StreamEdge> createChain(
 -  `StreamEdge`的分区类型为`ForwardPartitioner` 
 - 上下游节点的并行度一致
 - 当前`StreamGraph`允许`chain`
+
+**OperatorChain的结构**
+
+```Java
+//OperatorChain包含的所有StreamOperator
+private final StreamOperator<?>[] allOperators;
+//Operator之间传递数据Output
+private final RecordWriterOutput<?>[] streamOutputs;
+//监控统计
+private final WatermarkGaugeExposingOutput<StreamRecord<OUT>> chainEntryPoint;
+//OperatorChain的第一个Operator，数据数据从第一个Operator开始，依次执行
+private final OP headOperator;
+```
+
+**OperatorChain的头和尾**
+
+在OperatorChain中的第一个Operator被称为HeadOperator。
+
+<span id="op-chain-call-link-example">**调用链示例**</span>
+
+代码
+
+```java
+// ...
+DataStream<String> text = env.fromElements(WordCountData.WORDS);
+DataStream<Tuple2<String, Integer>> counts =
+	// split up the lines in pairs (2-tuples) containing: (word,1)
+	text.flatMap(new Tokenizer())
+		// group by the tuple field "0" and sum up tuple field "1"
+		.keyBy(0).sum(1).filter(new FilterFunction<Tuple2<String, Integer>>() {
+	@Override
+	public boolean filter(Tuple2<String, Integer> value) throws Exception {
+		return value.f1 > 1;
+	}
+});
+env.execute("Streaming WordCount");
+```
+
+生成的调用链
+
+```java
+StreamGroupedReduce.processElement
+--> CountingOutput.collect
+--> CopyChainingOutput.collect
+    --> StreamFilter.processElement
+    --> CountingOutput.collect
+    --> CopyChainingOutput.collect
+        --> StreamSink.processElement
+        --> CountingOutput.collect
+        --> BroadcastingOutputCollector.collect
+```
+
+后边在数据传递的部分会详细解释这个调用链。
 
 ### 总结
 
@@ -2677,14 +2731,14 @@ TASK::invoke
 	    task-specific-init
 	    initialize-operator-states
    	    open-operators
-	    //死循环处理数据
+	    //循环处理数据
 	    run
 	    //销毁阶段
 	    close-operators
 	    dispose-operators
 	    task-specific-cleanup
 	    common-cleanup
-
+	    
 ```
 
 ### Operator生命周期
@@ -2931,9 +2985,96 @@ Flink Types中的每一种类型都实现了序列化的write方法。
 
 RecordWriter将StreamRecord序列化完成之后，会根据flushAlways参数决定是否立即将数据进行推送，相当于1条记录发送一次，这样做延迟最低，但是吞吐量会下降，Flink默认的做法是单独启动一个线程，每隔一个固定时间flush一次所有的Channel，本质上是一种mini-batch（与spark的mini-batch不同）。
 
-### InputGate
+### ResultPartitionWriter & ResultPartition & ResultSubPartition
+
+**ResultPartitionWriter**是个基于Buffer的接口，其主要实现类是**ResultPartition**，
+
+![1560850603081](images/1560850603081.png)
 
 
+
+**ResultSubpartition**的主要实现类是PipelinedSubpartition , 该类提供了通知功能，当有新的数据写入buffer时，会回调BufferAvailabilityListener的notifyDataAvailable()方法。下面是BufferAvailabilityListener的几个实现类图示。
+
+### InputGate 
+
+输入网关（InputGate）是InputChannel的容器，用于消费中间结果（IntermediateResult）在并行执行时由子任务生产的一个或多个结果分区（ResultPartition）。
+
+> 可以认为生产端的ResultPartition跟消费端的InputGate是对等的。
+
+Flink当前提供了两个输入网关的实现
+
+- SingleInputGate：常规输入网关；
+- UnionInputGate：联合输入网关，它允许将多个输入网关联合起来；
+
+SingleInputGate是消费ResultPartition的实体，而UnionInputGate主要充当InputGate容器的角色。
+
+### InputChannel
+
+![1560856268726](images/1560856268726.png)
+
+- **LocalInputChannel**
+
+  对应于本地 subpartition的input channel，用来在本地进程内的不同线程之间的数据交换。
+
+  LocalInputChannel实际调用SingleInputGate.notifyChannelNonEmpty(InputChannel channel) ，这个方法调用inputChannelsWithData.notifyAll , 唤醒阻塞在inputChannelsWithData对象实例的所有线程。上文提到的阻塞在CheckPointBarrierHandler.getNextNonBlocked()方法的线程也会被唤醒，返回数据。
+
+- **RemoteInputChannel**
+
+  对应于远程的subpartition的input channel，用来表示跨网络的数据交换。
+
+- **UnknownInputChannel**
+
+
+
+**InputChannel的阻塞通知机制**
+
+ResultSubpartition的主要实现类是PipelinedSubpartition , 该类提供了通知功能，当有新的数据写入buffer时，会回调BufferAvailabilityListener的notifyDataAvailable()方法。下面是BufferAvailabilityListener的几个实现类图示。
+
+![img](images/14644552-fe445a28a565aeaa-1560858764552.png)
+
+
+
+### Output
+
+#### Output继承体系
+
+![1560822298491](images/1560822298491.png)
+
+
+
+**CountingOutput**
+
+封装类，用来在监控中统计发送的记录数量，其内部包装了一个有实际数据发送行为的的Output对象，用来进行真正的数据的emit。
+
+[参加OperatorChain调用链示例](#op-chain-call-link-example)
+
+**WatermarkGuageExposingOutput**
+
+此接口只是增加了获取当前 Input Watermark和Output Watermark的的方法。
+
+**RecordWriterOutput**
+
+使用RecordWriter进行实际的数据发送。RecordWriter主要用来在线程间、网络间数据序列化、写入，对应的RecordReader负责读取。
+
+**ChainingOutput & CopyingChainingOutput**
+
+这两个类是在OperatorChain内部的Operator之间传递数据用的，并不会有序列化的过程。直接在Output中调用下游Operator的processElement（）方法。<font color=red>直接在同一个线程内的Operator直接传递数据</font>，跟普通的Java方法调用一样，这样就直接省略了线程间的数据传送、网络间的数据传送的开销。
+
+**有选择的向下游发送**
+
+DirectedOutput 是有选择的发送，BroadcastingOutputCollector 是广播，两者的区别在于有没有OutputSelector。
+
+- **DirectedOutput & CopyingDirectedOutput**
+
+包装类，基于一组**OutputSelector**选择发送给下游哪些downstream。
+
+DirectedOutput共享对象模式， CopyingDirectedOutput非共享对象模式。
+
+- **BroadcastingOutputCollector & CopyingBroadcastingOutputCollector**
+
+  包装类，内部包含了一组Output。向所有的下游DownStream广播数据。
+
+  Copying和非Copying的区别是是否重用对象。
 
 ## 数据交换
 
@@ -2946,10 +3087,6 @@ RecordWriter将StreamRecord序列化完成之后，会根据flushAlways参数决
 - 同一线程的Operator之间的交换（Operator chain）
 
 在flink中，数据处理的业务逻辑位于UDF ProcessFunction.processElement中，每一个ProcessFunction绑定与1个Operator中，Operator调用UDF处理数据完毕之后，需要将数据交给下一个Operator。那么Flink是如何衔接Operator之间的数据传递的，答案就是Collector接口。
-
-Collector的类继承关系如下
-
-![1560408117101](/images/1560408117101.png)
 
 #### 本地线程间的数据传递
 
@@ -2984,11 +3121,103 @@ Operator FlatMap 所在线程 与 下游 Operator sum() 所在线程间的通信
 
 #### 同一线程的Operator之间的数据传递
 
+***同一线程的Operator即OperatorChain。***
+
 以Operator sum() 和Operator sink:Print to std 为例。 这两个Operator在同一个线程中运行，数据不需要经过序列化和写到多线程共享的buffer中， Operator sum()通过Collector发送数据后，直接调用Operator sink的processElement方法传递数据。
 
 如下图所示
 
 ![1560408523823](/images/1560408523823.png)
+
+### 总体过程
+
+**数据在task之间传递有如下几步**
+
+1.  数据在本operator处理完后，交给RecordWriter。每条记录都要选择一个下游节点，所以要经过ChannelSelector。
+2.  每个channel都有一个serializer（我认为这应该是为了避免多线程写的麻烦），把这条Record序列化为ByteBuffer
+
+3.  接下来数据被写入ResultPartition下的各个subPartition里，此时该数据已经存入DirectBuffer（MemorySegment）
+
+4.  单独的线程控制数据的flush速度，一旦触发flush，则通过Netty的nio通道向对端写入
+
+5.  对端的netty client接收到数据，decode出来，把数据拷贝到buffer里，然后通知InputChannel
+
+6. 有可用的数据时，下游算子从阻塞醒来，从InputChannel取出buffer，再解序列化成record，交给算子执行用户代码
+
+#### RecordWriter写入数据
+
+**StreamOperator处理完数据之后，交给RecordWriter**
+
+```java
+//RecordWriterOutput.java
+@Override
+public void collect(StreamRecord<OUT> record) {
+	if (this.outputTag != null) {
+		// we are only responsible for emitting to the main input
+		return;
+	}
+	//这里可以看到把记录交给了recordwriter
+	pushToRecordWriter(record);
+}
+```
+
+**RecordWriter向通道写入数据**
+
+选择通道
+
+```java
+//RecordWriter.java
+//选择通道
+public void emit(T record) throws IOException, InterruptedException {
+	checkErroneous();
+	emit(record, channelSelector.selectChannel(record));
+}
+private void emit(T record, int targetChannel) throws IOException, InterruptedException {
+	serializer.serializeRecord(record);
+    //根据调用的通道选择
+	if (copyFromSerializerToTargetChannel(targetChannel)) {
+		serializer.prune();
+	}
+}
+```
+
+**写入ResultPartition**
+
+```java
+private boolean copyFromSerializerToTargetChannel(int targetChannel) {
+	// We should reset the initial position of the intermediate serialization buffer before
+	// copying, so the serialization results can be copied to multiple target buffers.
+	serializer.reset();
+
+	boolean pruneTriggered = false;
+	BufferBuilder bufferBuilder = getBufferBuilder(targetChannel);
+	SerializationResult result = serializer.copyToBufferBuilder(bufferBuilder);
+	while (result.isFullBuffer()) {
+		numBytesOut.inc(bufferBuilder.finish());
+		numBuffersOut.inc();
+
+		// If this was a full record, we are done. Not breaking out of the loop at this point
+		// will lead to another buffer request before breaking out (that would not be a
+		// problem per se, but it can lead to stalls in the pipeline).
+		if (result.isFullRecord()) {
+			pruneTriggered = true;
+			bufferBuilders[targetChannel] = Optional.empty();
+			break;
+		}
+
+		bufferBuilder = requestNewBufferBuilder(targetChannel);
+		result = serializer.copyToBufferBuilder(bufferBuilder);
+	}
+	checkState(!serializer.hasSerializedData(), "All data should be written at once");
+
+	if (flushAlways) {
+		targetPartition.flush(targetChannel);
+	}
+	return pruneTriggered;
+}
+```
+
+
 
 ### 数据的写入和读取
 
@@ -2996,9 +3225,8 @@ Operator FlatMap 所在线程 与 下游 Operator sum() 所在线程间的通信
 
 ##### Buffer读取
 
-1.Task线程启动后，通过while循环调用StreamInputProcessor.processInput()消费和发送数据,上文所指的“线程阻塞在inputGate中的inputChannelWithData.wait()”这段逻辑也是在StreamInputProcessor.processInput中发生的。Task启动到Buffer读取的调用栈如下图所示,图例只展示了核心内容，省略了一些逻辑。
-
-2.在调用栈的后部，ResultSubpartition的子类PipelinedSubPartition通过BufferConsumer来读取Buffer。
+1.  Task线程启动后，通过while循环调用StreamInputProcessor.processInput()消费和发送数据,上文所指的“线程阻塞在inputGate中的inputChannelWithData.wait()”这段逻辑也是在StreamInputProcessor.processInput中发生的。Task启动到Buffer读取的调用栈如下图所示,图例只展示了核心内容，省略了一些逻辑。
+2.  在调用栈的后部，ResultSubpartition的子类PipelinedSubPartition通过BufferConsumer来读取Buffer。
 
 ![1560408708930](/images/1560408708930.png)
 
