@@ -2973,17 +2973,276 @@ NetworkBufferPool会计算自己所拥有的所有内存分片数，在分配新
 
 
 
+## 关键对象
+
 ### Record&RecordWriter
 
-最底层内存抽象是**MemorySegment**，用于数据传输的是**Buffer**，那么，承上启下对接从Java对象转为Buffer的中间对象是什么呢？是**StreamRecord** 。
+​		RecordWriter面向的是记录。ResultPatitionWriter面向的是Buffer。RecordWriter比ResultPartitionWriter的层级要高，底层依赖于ResultPartitionWriter。
 
-**StreamRecord<T>**是个Warp类，里面保存了原始的Java对象。另外，还保存了一个**timestamp**。 
+​		最底层内存抽象是**MemorySegment**，用于数据传输的是**Buffer**，那么，承上启下对接从Java对象转为Buffer的中间对象是什么呢？是**StreamRecord** 。
 
-**RecordWriter**类负责将**StreamRecord**进行序列化，调用**SpaningRecordSerializer**，再调用**BufferBuilder**写入**MemorySegment**中（每个Task都有自己的LocalBufferPool，LocalBufferPool中包含了多个MemorySegment）。
+​		**StreamRecord<T>**是个Warp类，里面保存了原始的Java对象。另外，还保存了一个**timestamp**。 
 
-Flink Types中的每一种类型都实现了序列化的write方法。
+​		**RecordWriter**类负责将**StreamRecord**进行序列化，调用**SpaningRecordSerializer**，再调用**BufferBuilder**写入**MemorySegment**中（每个Task都有自己的LocalBufferPool，LocalBufferPool中包含了多个MemorySegment）。
 
-RecordWriter将StreamRecord序列化完成之后，会根据flushAlways参数决定是否立即将数据进行推送，相当于1条记录发送一次，这样做延迟最低，但是吞吐量会下降，Flink默认的做法是单独启动一个线程，每隔一个固定时间flush一次所有的Channel，本质上是一种mini-batch（与spark的mini-batch不同）。
+​		Flink Types中的每一种类型都实现了序列化的**write**方法。
+
+
+
+**通道选择**
+
+​		在构建RecordWriter时，允许指定通道选择器（ChannelSelector）。
+
+> 所谓的通道选择器允许用户自定义某个记录的要存放在哪个输出通道中，如果不指定，那么Flink将会选择简单的顺序轮转选择器（RoundRobinChannelSelector）。
+
+
+
+在RecordWriter被初始化时，它所对应的ResultPartition的每个ResultSubpartition（输出信道）都会有对应一个独立的RecordSerializer，具体的类型是我们之前分析的SpanningRecordSerializer。
+
+RecordWriter会接收要写入的记录然后借助于ResultPartitionWriter将序列化后的Buffer写入特定的ResultSubpartition中去。
+
+​	**提供两种写入方式：**
+
+- 单播
+
+  根据ChannelSelector有选择的写入到某个通道
+
+- 广播
+
+  向所有的通道写入同样的数据
+
+​	**支持两种内容的写入：**
+
+- 记录Record
+
+  Flink处理的一条条数据记录。
+
+- 事件Event
+
+  Flink内部的系统事件，例如Checkpoint Barrier事件等。
+
+**单播写入代码实现**
+
+```java
+public void emit(T record) throws IOException, InterruptedException {
+    //遍历通道选择器选择出的通道（有可能选择多个通道），所谓的通道其实就是ResultSubpartition
+    for (int targetChannel : channelSelector.selectChannels(record, numChannels)) {
+        //获得当前通道对应的序列化器
+        RecordSerializer<T> serializer = serializers[targetChannel];
+
+        synchronized (serializer) {
+            //向序列化器中加入记录，加入的记录会被序列化并存入到序列化器内部的Buffer中
+            SerializationResult result = serializer.addRecord(record);
+            //如果Buffer已经存满
+            while (result.isFullBuffer()) {
+                //获得当前存储记录数据的Buffer
+                Buffer buffer = serializer.getCurrentBuffer();
+
+                //将Buffer写入ResultPartition中特定的ResultSubpartition
+                if (buffer != null) {
+                    writeBuffer(buffer, targetChannel, serializer);
+                }
+
+                //向缓冲池请求一个新的Buffer
+                buffer = writer.getBufferProvider().requestBufferBlocking();
+                //将新Buffer继续用来序列化记录的剩余数据，然后再次循环这段逻辑，直到数据全部被写入Buffer
+                result = serializer.setNextBuffer(buffer);
+            }
+        }
+    }
+}
+```
+
+从上述代码段中我们可以看到，如果记录的数据无法被单个Buffer所容纳，将会被拆分成多个Buffer存储，直到数据写完。而如果是广播记录或者广播事件，整个过程也是类似的，只不过变成了挨个遍历写入每个ResultSubpartition，而不是像上面这样通过通道选择器来选择。
+
+**结果Flush**
+
+​		**RecordWriter**将**StreamRecord**序列化完成之后，会根据**flushAlways**参数决定是否立即将数据进行推送，相当于1条记录发送一次，这样做延迟最低，但是吞吐量会下降，**Flink**默认的做法是单独启动一个线程，每隔一个固定时间**flush**一次所有的**Channel**，本质上是一种mini-batch（与spark的mini-batch不同）。
+
+当所有数据都写入完成后需要调用flush方法将可能残留在序列化器Buffer中的数据都强制输出。flush方法会遍历每个ResultSubpartition，然后依次取出该ResultSubpartition对应的序列化器，如果其中还有残留的数据，则将数据全部输出。这也是每个ResultSubpartition都对应一个序列化器的原因。
+
+### RecordReader(只在Batch中使用)
+
+​		写入器负责将生产者任务产生的中间结果数据写入到ResultSubpartition供消费者任务消费，而读取器则读取消费者任务所消费的数据并反序列化为记录。
+
+读取器有着比写入器相对复杂的设计，根据可变性分类为两类：
+
+- 不可变记录读取器（RecordReader）
+- 可变记录读取器（MutableRecordReader）
+
+继承关系如下图所示：
+
+![1561012530460](images/1561012530460.png)
+
+​		其中，最关键的是两个抽象类：AbstractReader和AbstractRecordReader。从类图来看，AbstractReader提供了最基础的实现。在分析写入器时，每个写入器都关联着结果分区（ResultPartition）。相应地，每个读取器也关联着对等的输入网关（InputGate）。
+
+AbstractReader主要对读取到的事件提供处理，以下代码段是处理事件的主逻辑：
+
+```java
+protected boolean handleEvent(AbstractEvent event) throws IOException {
+    final Class<?> eventType = event.getClass();
+
+    try {
+        //如果事件为消费完的特定结果子分区中的数据，则直接返回true
+        if (eventType == EndOfPartitionEvent.class) {
+            return true;
+        }
+        //如果事件是针对迭代的超步完成，则增加相应的超步完成计数 
+        else if (eventType == EndOfSuperstepEvent.class) {
+            return incrementEndOfSuperstepEventAndCheck();
+        }
+        //如果事件是TaskEvent，则直接用任务事件处理器发布
+        else if (event instanceof TaskEvent) {
+            taskEventHandler.publish((TaskEvent) event);
+
+            return false;
+        }
+        else {
+            throw new IllegalStateException("Received unexpected event of type " 
+                + eventType + " at reader.");
+        }
+    }
+    catch (Throwable t) {
+        throw new IOException("Error while handling event of type " + eventType + ": " + t.getMessage(), t);
+    }
+}
+```
+
+> AbstractReader对迭代的超步提供了统计，它内部维护了一个超步事件计数器currentNumberOfEndOfSuperstepEvents。这一点的实现跟检查点的屏障对齐机制类似。当计数器跟InputGate所包含的InputChannel数量相等时，说明超步事件已到达每个InputChannel，则可认为超步结束。
+
+AbstractRecordReader继承了AbstractReader，读取Record的方法，getNextRecord()，主要实现逻辑如下
+
+```java
+protected boolean getNextRecord(T target) throws IOException, InterruptedException {
+	if (isFinished) {
+		return false;
+	}
+
+	while (true) {
+        //如果当前反序列化器已被初始化，说明它当前正在序列化一个记录
+		if (currentRecordDeserializer != null) {
+			DeserializationResult result = 	
+                currentRecordDeserializer.getNextRecord(target);
+			
+            //如果获得结果是当前的Buffer已被消费（还不是记录的完整结果），获得当前的Buffer，将其回收，
+            //后续会继续反序列化当前记录的剩余数据
+			if (result.isBufferConsumed()) {
+				final Buffer currentBuffer = 
+                    currentRecordDeserializer.getCurrentBuffer();
+
+				currentBuffer.recycleBuffer();
+				currentRecordDeserializer = null;
+			}
+			 //如果结果表示记录已被完全消费，则返回true，跳出循环
+			if (result.isFullRecord()) {
+				return true;
+			}
+		}
+		//从InputGate读取数据
+		final BufferOrEvent bufferOrEvent = 
+            inputGate.getNext().orElseThrow(IllegalStateException::new);
+		
+		//如果读取到是是Buffer，则交给反序列化起进行反序列化
+		if (bufferOrEvent.isBuffer()) {
+           //设置当前的反序列化器，并将当前记录对应的Buffer给反序列化器
+			currentRecordDeserializer = 
+                recordDeserializers[bufferOrEvent.getChannelIndex()];
+			currentRecordDeserializer.setNextBuffer(bufferOrEvent.getBuffer());
+		}
+		//如果读取到的不是Buffer，则按照事件进行处理。
+		else {
+		//如果不是Buffer而是事件，则根据其对应的通道索引拿到对应的反序列化器判断其是否还有未完成的数据，
+        //如果有则抛出异常，因为这是一个新的事件，在处理它之前，反序列化器中不应该存在残留数据
+			if (recordDeserializers[bufferOrEvent.getChannelIndex()]
+                .hasUnfinishedData()) {
+				throw new IOException(...);
+			}
+			//调用事件处理的逻辑
+			if (handleEvent(bufferOrEvent.getEvent())) {
+				if (inputGate.isFinished()) {
+					isFinished = true;
+					return false;
+				}
+				else if (hasReachedEndOfSuperstep()) {
+					return false;
+				}
+				// else: More data is coming...
+			}
+		}
+	}
+}
+```
+
+
+
+### RecordSerializer & SerializationResult
+
+​		RecordSerializer，作为一个接口，SpanningRecordSerializer是其唯一的实现。
+
+![1560995001234](images/1560995001234.png)
+
+​		SpanningRecordSerializer是一种支持跨内存段的序列化器，其实现借助于中间缓冲区来缓存序列化后的数据，然后再往真正的目标Buffer里写，在写的时候会维护两个“指针”：
+
+- 一个是表示目标Buffer内存段长度的limit
+- 一个是表示其当前写入位置的position
+
+​		因为一个Buffer对应着一个内存段，当将数据序列化并存入内存段时，其空间有可能有剩余也有可能不够。因此，RecordSerializer定义了一个表示序列化结果的SerializationResult枚举。
+
+**序列化结果的几种类型**
+
+- **PARTIAL_RECORD_MEMORY_SEGMENT_FULL**
+
+  内存段已满但记录的数据只写入了部分，没有完全写完；
+
+- **FULL_RECORD_MEMORY_SEGMENT_FULL**
+
+  内存段写满，记录的数据已全部写入；
+
+- **FULL_RECORD**
+
+  记录的数据全部写入，但内存段并没有满；
+
+​		一个记录的序列化过程通常由setNextBuffer和addRecord这两个方法共同配合完成。其中setNextBuffer方法的主要作用是重新初始化一个新的Buffer作为目标Buffer并刷出剩余数据；而addRecord方法则主要用于进行真正的序列化操作。这两个方法的调用结果都返回的是SerializationResult。那么具体的序列化结果是如何判断的呢？这个逻辑由getSerializationResult方法完成：
+
+```java
+private SerializationResult getSerializationResult() {
+    //如果数据buffer中已没有更多的数据且长度buffer里也没有更多的数据，该判断可确认记录数据已全部写完
+    if (!this.dataBuffer.hasRemaining() && !this.lengthBuffer.hasRemaining()) {
+        //紧接着判断写入位置跟内存段的结束位置之间的关系，如果写入位置小于结束位置，则说明数据全部写入，
+        //否则说明数据全部写入且内存段也写满
+        return (this.position < this.limit)
+            ? SerializationResult.FULL_RECORD
+            : SerializationResult.FULL_RECORD_MEMORY_SEGMENT_FULL;
+    }
+ 
+    //任何一个buffer中仍存有数据，则记录只能被标记为部分写入
+    return SerializationResult.PARTIAL_RECORD_MEMORY_SEGMENT_FULL;
+}
+```
+
+### RecordDeserializer & DeserializationResult
+
+​		跟RecordSerializer类似，考虑到记录的数据大小以及Buffer对应的内存段的容量大小。在反序列化时也存在不同的反序列化结果，以枚举DeserializationResult表示：
+
+- **PARTIAL_RECORD**
+
+  表示记录并未完全被读取，但缓冲中的数据已被消费完成；
+
+- **INTERMEDIATE_RECORD_FROM_BUFFER**
+
+  表示记录的数据已被完全读取，但缓冲中的数据并未被完全消费；
+
+- **LAST_RECORD_FROM_BUFFER**
+
+  记录被完全读取，且缓冲中的数据也正好被完全消费；
+
+RecordDeserializer接口只有1个实现：
+
+- **SpillingAdaptiveSpanningRecordDeserializer**
+
+  适用于数据大小相对较大且跨段的记录的反序列化，它支持将溢出的数据写入临时文件；
+
+
 
 ### ResultPartitionWriter & ResultPartition & ResultSubPartition
 
@@ -2994,6 +3253,24 @@ RecordWriter将StreamRecord序列化完成之后，会根据flushAlways参数决
 
 
 **ResultSubpartition**的主要实现类是PipelinedSubpartition , 该类提供了通知功能，当有新的数据写入buffer时，会回调BufferAvailabilityListener的notifyDataAvailable()方法。下面是BufferAvailabilityListener的几个实现类图示。
+
+#### **ResultPartition**
+
+**ResultSubpartition的类型**
+
+- **BLOCKING**
+
+  持久化、非管道、无反压；
+
+- **BLOCKING_PERSISTENT**
+
+  当前暂不支持
+
+- **PIPELINED**
+
+  非持久化、支持管道、有反压；
+
+
 
 ### InputGate 
 
@@ -3075,6 +3352,14 @@ DirectedOutput共享对象模式， CopyingDirectedOutput非共享对象模式�
   包装类，内部包含了一组Output。向所有的下游DownStream广播数据。
 
   Copying和非Copying的区别是是否重用对象。
+
+### ChannelSelector
+
+![1561000925308](images/1561000925308.png)
+
+如上图ChannelSelector继承关系图所示
+
+
 
 ## 数据交换
 
@@ -3223,7 +3508,7 @@ private boolean copyFromSerializerToTargetChannel(int targetChannel) {
 
 #### Buffer的读取和写入
 
-##### Buffer读取
+##### Buffer读取（Streaming中的读取）
 
 1.  Task线程启动后，通过while循环调用StreamInputProcessor.processInput()消费和发送数据,上文所指的“线程阻塞在inputGate中的inputChannelWithData.wait()”这段逻辑也是在StreamInputProcessor.processInput中发生的。Task启动到Buffer读取的调用栈如下图所示,图例只展示了核心内容，省略了一些逻辑。
 2.  在调用栈的后部，ResultSubpartition的子类PipelinedSubPartition通过BufferConsumer来读取Buffer。
@@ -3272,19 +3557,794 @@ FlatMap和sum()是线程间通信，数据的发送最后会委托给实现了Co
 -> PartittionRequesetQueue.writeAndFlushNextMessageIfPossible
 ```
 
-至此数据真实的写入netty channel，发送给下游，
+至此数据真实的写入netty channel，发送给下游。
 
--> AbstractChannelHandlerContext.fireUserEventTriggered
 
--> PartittionRequesetQueue.enqueueAvailableReader
-
--> PartittionRequesetQueue.writeAndFlushNextMessageIfPossible
 
 ##### 从netty读取数据
 
 
 
+#  基于Netty网络通信
 
+## 关键对象
+
+### NettyShuffleEnvironment
+
+NettyShuffleEnvironment是TaskManager进行网络通信的主对象，主要用于跟踪中间结果并负责所有的数据交换。**每个TaskManager的实例对应一个NettyShuffleEnvironment**，而不是每个Task对应一个。在TaskManager启动时创建。NettyShuffleEnvironment管理着多个协助通信的关键组件。如下
+
+- **ResourceID**
+
+  用来表示Flink的分布式组件，在NettyShuffleEnvironment中，用来记录Task的位置（location）。
+
+- **NettyShuffleEnvironmentConfiguration**
+
+  NettyShuffleEvnironment的配置参数。
+
+- **NetworkBufferPool**
+
+  网络缓冲池，负责申请一个TaskManager的所有的内存段用作缓冲池
+
+- **ConnectionManager**
+
+  连接管理器，用于管理本地（远程）通信连接；
+
+- **ResultPartitionManager**
+
+  结果分区管理器，用于跟踪一个TaskManager上所有生产/消费相关的ResultPartition
+
+- **ResultPartitionFactory**
+
+  ResultPartition的工程，用来创建ResultPartition。
+
+-  **Map<InputGateID, SingleInputGate>**
+
+  
+
+- **SingleInputGateFactory**
+
+  创建SingleInputGate的工厂。
+
+### NettyConnectionManager
+
+Netty连接管理器（NettyConnectionManager）是连接管理器接口（ConnectionManager）针对基于Netty的远程连接管理的实现者。它是TaskManager中负责网络通信的网络环境对象（NetworkShuffleManager）的核心组件之一。
+
+​		NettyConnectionManager继承自ConnectionManager，ConnectionManager的继承体系如下
+
+![1561022745831](images/1561022745831.png)
+
+​		如上图所示，ConnectionManager定义了start、shutdown、closeOpenChannelConnections等方法用于管理physical connections；它有两个子类，一个是LocalConnectionManager，一个是NettyConnectionManager。
+
+- LocalConnectionManager实现了ConnectionManager接口，不过它的实现基本是空操作；
+- NettyConnectionManager实现了ConnectionManager接口，它的构造器使用NettyConfig创建了NettyServer、NettyClient、NettyBufferPool。
+
+**TaskManager与NettyConnectionManager的关系**
+
+​		一个TaskManager中可能同时运行着很多任务实例，有时某些任务需要消费某远程任务所生产的结果分区，有时某些任务可能会生产结果分区供其他任务消费。所以对一个TaskManager来说，其职责并非单一的，它既可能充当客户端的角色也可能充当服务端角色。因此，一个NettyConnectionManager会同时管理着一个Netty客户端（NettyClient）和一个Netty服务器（NettyServer）实例。当然除此之外还有一个Netty缓冲池（NettyBufferPool）以及一个分区请求客户端工厂（PartitionRequestClientFactory，用于创建分区请求客户端PartitionRequestClient），这些对象都在NettyConnectionManager构造器中被初始化。
+
+> 每个PartitionRequestClientFactory实例都依赖一个NettyClient。也就是说所有PartitionRequestClient底层都共用一个NettyClient。
+
+
+
+**Netty客户端和服务器的启停**
+
+​		Netty客户端和服务器对象的启动和停止都是由NettyConnectionManager统一控制的。	
+
+​		NettyConnectionManager启动的时机是当TaskManager跟JobManager关联上之后调用NetworkEnvironment的associateWithTaskManagerAndJobManager方法时。而当TaskManager跟JobManager解除关联时停止。
+
+### NettyBufferPool
+
+NettyClient和NettyServer在实例化Netty通信的核心对象时都需要配置各自的“字节缓冲分配器”用于为Netty读写数据分配内存单元。Netty自身提供了一个池化的字节缓冲分配器（PooledByteBufAllocator），但Flink又在此基础上进行了包装并提供了Netty缓冲池（NettyBufferPool）。此举的目的是严格控制所创建的分配器（Arena）的个数，转而依赖TaskManager的相关配置指定。
+
+> **Arena**
+>
+> 当指定PooledByteBufAllocator来执行ByteBuf分配时，最终的内存分配工作被委托给类PoolArena。由于Netty通常用于高并发系统，所以各个线程进行内存分配时竞争不可避免，这可能会极大的影响内存分配的效率，为了缓解高并发时的线程竞争，Netty允许使用者创建多个分配器（Arena）来分离锁，提高内存分配效率。
+
+**NettyBufferPool的改进**
+
+​		NettyBufferPool在构造器内部以固定的参数实例化PooledByteBufAllocator并作为自己的内部分配器。对PooledByteBufAllocator做了一些限制：
+
+- **限定为堆外内存**
+
+  PooledByteBufAllocator本身既支持堆内存分配也支持堆外内存分配，NettyBufferPool将其限定为只在堆外内存上进行分配。
+
+- **显式指定了pageSize大小为8192，maxOrder值为11。**
+
+  Netty中的内存池包含页（page）和块（chunk）两种分配单位，通过PooledByteBufAllocator构造器可以设置页大小（也即pageSize参数），该参数在PooledByteBufAllocator中的默认值为8192，而参数maxOder则用于计算块的大小。
+
+  > 计算公式为：chunkSize = pageSize << maxOrder；因此这里块大小为16MB。
+
+- **显式关闭了堆内内存的相关的操作方法**
+
+  NettyBufferPool通过反射还拿到了PooledByteBufAllocator中的PoolArena分配器对象集合，但此举更多的是出于调试目的。并且显式关闭了对堆内存相关的操作方法。
+
+### NettyClient
+
+​	NettyClient的主要职责是初始化Netty客户端的核心对象，并根据NettyProtocol配置用于客户端事件处理的ChannelPipeline。
+
+> NettyClient并不用于发起远程结果子分区请求，该工作将由PartitionRequestClient完成。
+
+一个Netty引导客户端的创建步骤如下：
+
+- 创建Bootstrap对象用来引导启动客户端：
+
+```java
+bootstrap = new Bootstrap();
+```
+
+- 创建NioEventLoopGroup或EpollEventLoopGroup对象并设置到Bootstrap中，EventLoopGroup可以理解为是一个线程池，用来处理连接、接收数据、发送数据：
+
+```java
+switch (config.getTransportType()) {
+    case NIO:
+        initNioBootstrap();
+        break;
+
+    case EPOLL:
+        initEpollBootstrap();
+        break;
+
+    case AUTO:
+        if (Epoll.isAvailable()) {
+            initEpollBootstrap();
+            LOG.info("Transport type 'auto': using EPOLL.");
+        }
+        else {
+            initNioBootstrap();
+            LOG.info("Transport type 'auto': using NIO.");
+        }
+}
+
+```
+
+> 注意以上设置的是基于NettyPotocol获得的一个ChannelHandler数组组成的管道。
+
+- 调用Bootstrap.connect()来连接服务器：
+
+```java
+return bootstrap.connect(serverSocketAddress);
+```
+
+以上就是一个Netty客户端从初始化到跟服务器建立连接的大致过程。但这里需要注意的是，一个TaskManager根本上只会存在一个NettyClient对象（对应的也只有一个Bootstrap实例）。但一个TaskManager中的子任务实例很有可能会跟多个不同的远程TaskManager通信，所以同一个Bootstrap实例可能会跟多个目标服务器建立连接，所以它是复用的，这一点不存在问题因为无论跟哪个目标服务器通信，Bootstrap的配置都是不变的。至于不同的RemoteChannel如何跟某个连接建立对应关系，这一点由PartitionRequestClientFactory来保证。
+
+### NettyServer
+
+跟NettyClient一样，NettyServer也会初始化Netty服务端的核心对象，除此之外它会启动对特定端口的侦听并准备接收客户端发起的请求。下面是NettyServer的初始化与启动步骤：
+
+- 创建ServerBootstrap实例来引导绑定和启动服务器：
+
+  ```java
+  bootstrap = new ServerBootstrap();
+  ```
+
+- 根据配置创建NioEventLoopGroup或EpollEventLoopGroup对象来处理事件，如接收新连接、接收数据、写数据等等：
+
+  ```java
+  switch (config.getTransportType()) {
+      case NIO:
+          initNioBootstrap();
+          break;
+      case EPOLL:
+      	initEpollBootstrap();
+      	break;
+      case AUTO:
+          if (Epoll.isAvailable()) {
+              initEpollBootstrap();
+              LOG.info("Transport type 'auto': using EPOLL.");
+          }
+          else {
+              initNioBootstrap();
+              LOG.info("Transport type 'auto': using NIO.");
+  }
+  ```
+
+  
+
+- 指定InetSocketAddress，服务器监听此端口：
+
+  ```java
+  bootstrap.localAddress(config.getServerAddress(), config.getServerPort());
+  ```
+
+- 进行各种参数配置，设置childHandler执行所有的连接请求：
+
+  ```java
+  bootstrap.childHandler(new ChannelInitializer<SocketChannel>() {
+      @Override
+      public void initChannel(SocketChannel channel) throws Exception {
+          channel.pipeline().addLast(protocol.getServerChannelHandlers());
+      }
+  });
+  ```
+
+  > 注意以上设置的是基于NettyPotocol获得的一个ChannelHandler数组组成的管道。
+
+
+指定InetSocketAddress，服务器监听此端口：
+bootstrap.localAddress(config.getServerAddress(), config.getServerPort());
+1
+进行各种参数配置，设置childHandler执行所有的连接请求：
+bootstrap.childHandler(new ChannelInitializer<SocketChannel>() {
+    @Override
+    public void initChannel(SocketChannel channel) throws Exception {
+        channel.pipeline().addLast(protocol.getServerChannelHandlers());
+    }
+});
+
+注意以上设置的是基于NettyPotocol获得的一个ChannelHandler数组组成的管道。
+
+- 都设置完毕了，最后调用ServerBootstrap.bind()方法来绑定服务器：
+
+  ```java
+  bindFuture = bootstrap.bind().syncUninterruptibly();
+  ```
+
+  
+
+### PartitionRequestClient
+
+​		分区请求客户端（PartitionRequestClient）用于发起远程PartitionRequest请求，它也是RemoteChannel跟Netty通信层之间进行衔接的对象。
+
+​		对单一的TaskManager而言只存在一个NettyClient实例。但处于同一TaskManager中不同的任务实例可能会跟不同的远程TaskManager上的任务之间交换数据，不同的TaskManager实例会有不同的ConnectionID（用于标识不同的IP地址）。因此，Flink采用PartitionRequestClient来对应ConnectionID，并提供了分区请求客户端工厂（PartitionRequestClientFactory）来创建PartitionRequestClient并保存ConnectionID与之的对应关系。
+
+```java
+public ChannelFuture requestSubpartition(
+        final ResultPartitionID partitionId,
+        final int subpartitionIndex,
+        final RemoteInputChannel inputChannel,
+        int delayMs) throws IOException {
+    checkNotClosed();
+
+    //将当前请求数据的RemoteInputChannel的实例注入到NettyClient的ChannelHandler管道的
+    //PartitionRequestClientHandler实例中
+    partitionRequestHandler.addInputChannel(inputChannel);
+
+    //构建PartitionRequest请求对象
+    final PartitionRequest request = new PartitionRequest(
+            partitionId, subpartitionIndex, inputChannel.getInputChannelId());
+
+    //构建一个ChannelFutureListener的实例，当I/O操作执行失败后，会触发相关的错误处理逻辑
+    final ChannelFutureListener listener = new ChannelFutureListener() {
+        @Override
+        public void operationComplete(ChannelFuture future) throws Exception {
+            if (!future.isSuccess()) {
+                partitionRequestHandler.removeInputChannel(inputChannel);
+                inputChannel.onError(
+                        new LocalTransportException(
+                                "Sending the partition request failed.",
+                                future.channel().localAddress(), future.cause()
+                        ));
+            }
+        }
+    };
+
+    //立即发送该请求，并注册listener
+    if (delayMs == 0) {
+        ChannelFuture f = tcpChannel.writeAndFlush(request);
+        f.addListener(listener);
+        return f;
+    }
+    //如果请求需要延迟一定的时间，则延迟发送请求
+    else {
+        final ChannelFuture[] f = new ChannelFuture[1];
+        tcpChannel.eventLoop().schedule(new Runnable() {
+            @Override
+            public void run() {
+                f[0] = tcpChannel.writeAndFlush(request);
+                f[0].addListener(listener);
+            }
+        }, delayMs, TimeUnit.MILLISECONDS);
+
+        return f[0];
+    }
+}
+```
+
+### NettyMessage
+
+![1561031965898](images/1561031965898.png)
+
+**不同的消息类型**
+
+> **服务端的消息**
+>
+> - BufferResponse：服务端给出的Buffer响应消息，编号为0；
+> - ErrorResponse：服务端的错误响应消息，编号为1；
+
+> **客户端的消息**
+>
+> - PartitionRequest：客户端发起的分区请求，编号为2；
+> - TaskEventRequest：客户端发起的任务事件请求，编号为3；
+> - CancelPartitionRequest：客户端发起的取消分区请求，编号为4；
+> - CloseRequest：客户端发起的关闭请求，编号为5；
+> - AddCredit：客户端发起的调整流控消息，编号为6；
+
+另外，NettyMessagen内部定义了读写接口，面向的对象是Netty的字节缓冲（ByteBuf）。解编码器NettyMessageEncoder和NettyMessageDecoder以静态内部类实现，分别用来在消息的两种表示（NettyMessage和ByteBuf）之间进行转换。
+
+### NettyProtocol
+
+NettyProtocol定义了基于Netty进行网络通信时客户端和服务端对事件的处理逻辑与顺序。由于Netty中所有事件处理逻辑的代码都处于扩展自ChannelHandler接口的类中，所以，NettyProtocol约定了所有的协议实现者，必须提供服务端和客户端处理逻辑的ChannelHandler数组。
+
+最终这些ChannelHandler将依据它们在数组中的顺序进行链接以形成ChannelPipeline。
+
+PartitionRequestProtocol作为NettyProtocol唯一的实现，负责实例化并编排客户端和服务端的ChannelHandler。按照顺序链接的这些ChannelHandler可被视为“协议栈”。接下来，我们分别就客户端和服务端的协议栈给出了图示
+
+**服务端协议栈**
+
+```java
+/*
+* +-------------------------------------------------------------------+
+* |                        SERVER CHANNEL PIPELINE                    |
+* |                                                                   |
+* |    +----------+----------+ (3) write  +----------------------+    |
+* |    | Queue of queues     +----------->| Message encoder      |    |
+* |    +----------+----------+            +-----------+----------+    |
+* |              /|\                                 \|/              |
+* |               | (2) enqueue                       |               |
+* |    +----------+----------+                        |               |
+* |    | Request handler     |                        |               |
+* |    +----------+----------+                        |               |
+* |              /|\                                  |               |
+* |               |                                   |               |
+* |   +-----------+-----------+                       |               |
+* |   | Message+Frame decoder |                       |               |
+* |   +-----------+-----------+                       |               |
+* |              /|\                                  |               |
+* +---------------+-----------------------------------+---------------+
+* |               | (1) client request               \|/
+* +---------------+-----------------------------------+---------------+
+* |               |                                   |               |
+* |       [ Socket.read() ]                    [ Socket.write() ]     |
+* |                                                                   |
+* |  Netty Internal I/O Threads (Transport Implementation)            |
+* +-------------------------------------------------------------------+
+*/
+```
+
+同客户端协议栈，服务端协议栈也会被构建成ChannelPipeline并注册到服务端引导对象ServerBootstrap中：
+
+```java
+bootstrap.childHandler(newChannelInitializer<SocketChannel>(){
+    @Override
+    publicvoidinitChannel(SocketChannelchannel)throwsException{
+        channel.pipeline().addLast(protocol.getServerChannelHandlers());
+    }});
+```
+
+
+
+**客户端协议栈**
+
+```java
+/**
+ *     +-----------+----------+            +----------------------+
+ *     | Remote input channel |            | request client       |
+ *     +-----------+----------+            +-----------+----------+
+ *                 |                                   | (1) write
+ * +---------------+-----------------------------------+---------------+
+ * |               |     CLIENT CHANNEL PIPELINE       |               |
+ * |               |                                  \|/              |
+ * |    +----------+----------+            +----------------------+    |
+ * |    | Request handler     +            | Message encoder      |    |
+ * |    +----------+----------+            +-----------+----------+    |
+ * |              /|\                                 \|/              |
+ * |               |                                   |               |
+ * |    +----------+------------+                      |               |
+ * |    | Message+Frame decoder |                      |               |
+ * |    +----------+------------+                      |               |
+ * |              /|\                                  |               |
+ * +---------------+-----------------------------------+---------------+
+ * |               | (3) server response              \|/ (2) client request
+ * +---------------+-----------------------------------+---------------+
+ * |               |                                   |               |
+ * |       [ Socket.read() ]                    [ Socket.write() ]     |
+ * |                                                                   |
+ * |  Netty Internal I/O Threads (Transport Implementation)            |
+ * +-------------------------------------------------------------------+
+ */
+```
+
+PartitionRequestProtocol构建出的客户端协议栈将会被构建成ChannelPipeline，并注册到客户端引导对象Bootstrap中：
+
+```java
+bootstrap.handler(newChannelInitializer<SocketChannel>(){
+    @Override
+    publicvoidinitChannel(SocketChannelchannel)throwsException{
+        channel.pipeline().addLast(protocol.getClientChannelHandlers());
+	}
+});
+```
+
+
+
+### 客户端核心处理器
+
+户端协议栈中的核心的处理器PartitionRequestClientHandler，该处理器用于处理服务端的响应消息。
+
+以客户端获取到响应之后回调该处理器的channelRead方法为入口来进行分析：
+
+```java
+public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+    try {
+        //当没有待解析的原始消息时，直接解码消息，否则将消息加入到stagedMessages队列中，等待排队处理
+        if (!bufferListener.hasStagedBufferOrEvent() && stagedMessages.isEmpty()) {
+            decodeMsg(msg);
+        }
+        else {
+            stagedMessages.add(msg);
+        }
+    }
+    catch (Throwable t) {
+        notifyAllChannelsOfErrorAndClose(t);
+    }
+}
+```
+
+上例中涉及到了两个关键的对象：
+
+- bufferListener，用于感知可用Buffer的事件侦听器。它是PartitionRequestClientHandler的内部类。
+
+- stagedMessages，用于接收原始未解码消息的队列。
+
+解码方法decodeMsg的主要逻辑包含对两种类型消息的解析：
+
+- 服务端的错误响应消息ErrorResponse
+- 正常的Buffer请求响应消息BufferResponse。
+
+​		对于错误响应消息会判断是否是致命错误，如果是致命错误，则直接通知所有的InputChannel并关闭它们；如果不是，则让该消息对应的InputChannel按不同情况处理。
+
+下边重点关注对BufferResponse的处理：
+
+```java
+if (msgClazz == NettyMessage.BufferResponse.class) {
+    NettyMessage.BufferResponse bufferOrEvent = (NettyMessage.BufferResponse) msg;
+    //根据响应消息里的receiverId，从注册map里获取到接收该消息的RemoteInputChannel实例
+    RemoteInputChannel inputChannel = inputChannels.get(bufferOrEvent.receiverId);
+    //如果该响应没有对应的接收者，则释放该Buffer，同时通知服务端取消该请求
+    if (inputChannel == null) {
+        bufferOrEvent.releaseBuffer();
+        cancelRequestFor(bufferOrEvent.receiverId);
+        return true;
+    }
+
+    //接下来才进入到真正的解析逻辑
+    return decodeBufferOrEvent(inputChannel, bufferOrEvent);
+}
+```
+
+在decodeBufferOrEvent中，它会对该消息具体是Buffer还是Event进行区分，如果是Buffer：
+
+```java
+if (bufferOrEvent.isBuffer()) {
+    //空Buffer
+    if (bufferOrEvent.getSize() == 0) {
+        inputChannel.onEmptyBuffer(bufferOrEvent.sequenceNumber);
+        return true;
+    }
+
+    //获得Buffer提供者，如果为空，则通知服务端取消请求
+    BufferProvider bufferProvider = inputChannel.getBufferProvider();
+    if (bufferProvider == null) {
+        cancelRequestFor(bufferOrEvent.receiverId);
+        return false;
+    }
+
+    while (true) {
+        //从Buffer提供者请求Buffer，以放置响应结果数据
+        Buffer buffer = bufferProvider.requestBuffer();
+        //如果请求到Buffer，则读取数据同时触发InputChannel的onBuffer回调
+        //该方法在前文分析输入通道时我们早已提及过，它会将Buffer加入到队列中
+        if (buffer != null) {
+            buffer.setSize(bufferOrEvent.getSize());
+            bufferOrEvent.getNettyBuffer().readBytes(buffer.getNioBuffer());
+            inputChannel.onBuffer(buffer, bufferOrEvent.sequenceNumber);
+            return true;
+        }
+        //否则进入等待模式，当有Buffer可用时，会触发bufferListener的onEvent方法
+        else if (bufferListener.waitForBuffer(bufferProvider, bufferOrEvent)) {
+            releaseNettyBuffer = false;
+            return false;
+        }
+        else if (bufferProvider.isDestroyed()) {
+            return false;
+        }
+    }
+}
+```
+
+​		如果从Buffer提供者没有获取到Buffer，说明当前没有可用的Buffer资源了，那么将进入等待模式。这里等待Buffer可用是基于事件侦听机制，这个机制是如何实现的呢？在上面的waitForBuffer方法的实现中，通过将当前的BufferListenerTask的bufferListener实例反向注册到Buffer提供者，当Buffer提供者中有Buffer可用时，将会触发bufferListener的onEvent回调方法。这里需要注意的是，当Buffer提供者中的Buffer从无到有，说明有Buffer被回收了，所以onEvent方法是被回收Buffer的线程所调用，而非Netty的I/O线程。
+
+到此，我们才获取到可用的Buffer并读取了响应消息的原始数据，但数据还没有被解码。是不是解码的过程也发生在onEvent方法中呢？其实不然，在onEvent方法里，它将对原始消息的处理权交还给了Netty的I/O线程：
+
+```java
+if (buffer != null) {
+    if (availableBuffer.compareAndSet(null, buffer)) {
+        ctx.channel().eventLoop().execute(this);
+
+        success = true;
+    }
+    else {
+        throw new IllegalStateException("Received a buffer notification, " +
+            " but the previous one has not been handled yet.");
+    }
+}
+```
+
+代码段中会通过上下文对象获取到Channel所处的EventLoop，然后通过它的execute方法接收一个Runnable实例并在新线程执行。这里接收的this就是当前的bufferListener实例（因为BufferListenerTask也实现了Runnable接口）。所以在BufferListenerTask的onEvent方法中其实存在着一个线程执行的桥接过程。
+
+以上就是NettyClient接收到NettyServer的响应后的处理器逻辑。由于Buffer资源受限，这里并没有直接将原始消息直接交与Netty的I/O线程并写到Buffer中，而是采取了队列缓存原始消息外加Buffer可用事件通知的机制来进行处理。
+
+### 服务端核心处理器
+
+服务端有两个核心处理器，分别是PartitionRequestServerHandler和PartitionRequestQueue。其中，PartitionRequestServerHandler会依赖PartitionRequestQueue的实例。
+
+#### **PartitionRequestServerHandler**
+
+PartitionRequestServerHandler是一种通道流入处理器（ChannelInboundHandler），主要用于初始化数据传输同时分发事件。
+
+首先，PartitionRequestServerHandler会在Channel启动时创建一个容量至少为1的BufferPool。当然最关键的方法还是消息的处理方法channelRead0()。
+
+> Netty提供了一个简化版的ChannelInboundHandler的实现，名为SimpleChannelInboundHandler。通过继承这个类，你可以非常方便得专注于实现自己的业务逻辑。因此，SimpleChannelInboundHandler类已经对ChannelInboundHandler的channelRead接口方法提供了基础实现，然后提供了名为channelRead0的抽象方法供派生类扩展。
+
+从channelRead0方法的实现来看，客户端的请求消息被划分为三类：
+
+- 常规的结果分区请求；
+- 任务事件请求；
+- 其他请求；
+
+针对不同类型的客户端消息有不同的处理逻辑如下：
+
+**常规的结果分区请求**
+
+```java
+if (msgClazz == PartitionRequest.class) {
+    PartitionRequest request = (PartitionRequest) msg;
+
+    try {
+        //构建结果子分区视图对象，并将其“加入队列”
+        ResultSubpartitionView subpartition =
+            partitionProvider.createSubpartitionView(
+            request.partitionId,
+            request.queueIndex,
+            bufferPool);
+
+        outboundQueue.enqueue(subpartition, request.receiverId);
+    }
+    catch (PartitionNotFoundException notFound) {
+        respondWithError(ctx, notFound, request.receiverId);
+    }
+}
+```
+
+代码段中的outboundQueue是PartitionRequestQueue的实例，这里注意不要被其类名误导，它本身并不是一个队列数据结构的实现，但它内部的处理机制确实借助了队列结构来排队请求。outboundQueue同时也是在协议栈中紧随着PartitionRequestServerHandler的流入处理器PartitionRequestQueue的实例，这一点下文还会提到。
+
+**任务事件请求**
+
+```java
+else if (msgClazz == TaskEventRequest.class) {
+    TaskEventRequest request = (TaskEventRequest) msg;
+
+    //针对事件请求，将会通过任务事件分发器进行分发，如果分发失败，将会以错误消息予以响应
+    if (!taskEventDispatcher.publish(request.partitionId, request.event)) {
+        respondWithError(ctx, 
+                         new IllegalArgumentException("Task event receiver not found."), 
+            request.receiverId);
+    }
+}
+```
+
+> 什么情况下会导致事件分发失败呢？当事件分发时根据其partitionId如果找不到对应的侦听者时，就会认为事件分发失败。
+
+**其他类型的请求**
+
+```java
+//如果是取消请求，则调用队列的取消方法
+else if (msgClazz == CancelPartitionRequest.class) {
+    CancelPartitionRequest request = (CancelPartitionRequest) msg;
+    outboundQueue.cancel(request.receiverId);
+}
+//如果是关闭请求，则关闭队列
+else if (msgClazz == CloseRequest.class) {
+    outboundQueue.close();
+}
+//如果是流控请求，则调用处理流控的方法
+else if (msgClazz == AddCredit.class) {
+    AddCredit request = (AddCredit) msg;
+    outboundQueue.addCredit(request.receiverId, request.credit);
+}
+else {
+    LOG.warn("Received unexpected client request: {}", msg);
+}
+```
+
+
+
+从上面的代码段可见，PartitionRequestServerHandler主要起到消息分发的作用。因此我们会重点分析消息的处理者PartitionRequestQueue。
+
+#### PartitionRequestQueue
+
+我们首先分析一下PartitionRequestServerHandler在处理消息时调用的PartitionRequestQueue的实例方法enqueue和cancel起到了什么作用。enqueue方法的实现如下：
+
+```java
+public void enqueue(ResultSubpartitionView partitionQueue, InputChannelID receiverId) throws Exception {
+    ctx.pipeline().fireUserEventTriggered(
+    	new SequenceNumberingSubpartitionView(partitionQueue, receiverId));
+}
+```
+
+可以看到它把原先的ResultSubpartitionView包装为SequenceNumberingSubpartitionView。然后调用fireUserEventTriggered来触发管道中的下一个ChannelInboundHandler的userEventTriggered方法。
+
+SequenceNumberingSubpartitionView是什么？它是PartitionRequestQueue内部实现的一个ResultSubpartitionView的包装器。该包装器对原始的ResultSubpartitionView做了两件事：对每个即将返回的Buffer累加序列号同时保存相应的接收者（InputChannel）编号。
+
+> Buffer的序列号主要用于跟客户端校验消费Buffer的过程是否跟服务端的处理过程保持一致，这主要用于防止Buffer丢失。
+
+那么下一个ChannelInboundHandler是谁呢？我们先回顾一下，在PartitionRequestProtocol协议中所组建的管道中的处理器的顺序：
+
+```java
+public ChannelHandler[] getServerChannelHandlers() {
+    PartitionRequestQueue queueOfPartitionQueues = new PartitionRequestQueue();
+    PartitionRequestServerHandler serverHandler = 
+        new PartitionRequestServerHandler(partitionProvider, taskEventDispatcher, 							queueOfPartitionQueues, networkbufferPool);
+
+    return new ChannelHandler[] {
+            messageEncoder,
+            createFrameLengthDecoder(),
+            messageDecoder,
+            serverHandler,
+            queueOfPartitionQueues
+    };
+}
+```
+
+从上面的代码可见，queueOfPartitionQueues这一实例既作为参数传入PartitionRequestServerHandler的构造器又在ChannelHandler数组中充当处理器。而此处的queueOfPartitionQueues跟PartitionRequestServerHandler中的outboundQueue指向同一个对象。而因为enqueue方法的调用者是PartitionRequestServerHandler的实例方法，所以，下一个ChannelInboundHandler的实例其实就是这里的outboundQueue本身。
+
+所以，fireUserEventTriggered方法的调用，将会触发同一个PartitionRequestQueue实例的userEventTriggered方法。在userEventTriggered方法的实现中，也是按照不同的消息类型来区分处理的。首先当然是
+
+```java
+if (msg.getClass() == SequenceNumberingSubpartitionView.class) {
+    boolean triggerWrite = queue.isEmpty();
+    //将消息强制转型并加入队列
+    queue.add((SequenceNumberingSubpartitionView) msg);
+    //如果队列在消息加入前是空的，则说明可以响应消息给客户端了
+    if (triggerWrite) {
+        writeAndFlushNextMessageIfPossible(ctx.channel());
+    }
+}
+```
+
+看完了enqueue方法，下面我们来看cancel如何实现：
+
+```java
+public void cancel(InputChannelID receiverId) {
+    ctx.pipeline().fireUserEventTriggered(receiverId);
+}
+```
+
+该调用对应了userEventTriggered中的另一段处理逻辑：
+
+```java
+else if (msg.getClass() == InputChannelID.class) {
+    InputChannelID toCancel = (InputChannelID) msg;
+
+    //如果当前InputChannelID已包含在释放过的集合中，那么直接返回
+    if (released.contains(toCancel)) {
+        return;
+    }
+
+    //如果当前的结果子分区视图不为空且其接收者编号跟当前待取消的编号相等，
+    //则释放相关资源，并将该编号加入已释放集合
+    if (currentPartitionQueue != null && 	
+        currentPartitionQueue.getReceiverId().equals(toCancel)) {
+        
+        currentPartitionQueue.releaseAllResources();
+        markAsReleased(currentPartitionQueue.receiverId);
+        currentPartitionQueue = null;
+    }
+    else {
+        int size = queue.size();
+
+        //遍历队列，将接收者编号跟当前准备取消的InputChannelID进行比较，
+        //如果相等则对视图的相关资源进行释放同时将编号加入已释放集合
+        for (int i = 0; i < size; i++) {
+            SequenceNumberingSubpartitionView curr = queue.poll();
+
+            if (curr.getReceiverId().equals(toCancel)) {
+                curr.releaseAllResources();
+                markAsReleased(curr.receiverId);
+            }
+            else {
+                queue.add(curr);
+            }
+        }
+    }
+}
+```
+
+接下来，我们来分析一下处理器输出响应消息的writeAndFlushNextMessageIfPossible方法。在分析该方法的实现之前，我们先看一下，该方法何时会触发？当前在PartitionRequestQueue中该方法共有三个调用点。
+
+**writeAndFlushNextMessageIfPossible的三个调用点**
+
+1. 第一个调用点位于ChannelInboundHandler的channelWritabilityChanged事件回调方法中。
+
+> channelWritabilityChanged方法是ChannelInboundHandler的接口方法，当Channel的可写状态发生改变时会被调用。Channel的isWritable()方法可以用来检测其可写性。可写性的阈值范围可以通过Channel.config().setWriteHighWaterMark()以及Channel.config().setWriteLowWaterMark()进行设置。
+>
+
+2. 第二个调用点位于userEventTriggered回调方法中，这在我们上文分析该方法时已经提及过。
+
+3. 第三个调用点处于PartitionRequestQueue内部对ChannelFutureListener接口的实现类WriteAndFlushNextMessageIfPossibleListener中。
+
+   > ChannelFutureListener用于注册到ChannelFuture中，当I/O操作完成之后，会触发对其方法operationComplete的调用。
+
+​		而WriteAndFlushNextMessageIfPossibleListener的实现，就是在其operationComplete方法中触发了对writeAndFlushNextMessageIfPossible方法的调用。那么WriteAndFlushNextMessageIfPossibleListener何时会被注册到ChannelFuture呢，毕竟不注册是不会触发operationComplete的。而注册点正好位于writeAndFlushNextMessageIfPossible的实现中。
+
+**WriteAndFlushNextMessageIfPossibleListener的核心代码如下**
+
+```java
+//如果channel的状态为可写才会继续执行如下逻辑
+if (channel.isWritable()) {
+    while (true) {
+        //如果当前结果子分区视图为空，同时队列里也没有待处理的记录了，则退出循环
+        if (currentPartitionQueue == null && (currentPartitionQueue = queue.poll()) == null) {
+            return;
+        }
+
+        //从结果子分区视图获得待响应的原始数据
+        buffer = currentPartitionQueue.getNextBuffer();
+
+        //如果为null，则不做响应，继续循环处理队列中的记录
+        if (buffer == null) {
+            if (currentPartitionQueue.registerListener(null)) {
+                currentPartitionQueue = null;
+            }
+            else if (currentPartitionQueue.isReleased()) {
+                markAsReleased(currentPartitionQueue.getReceiverId());
+
+                Throwable cause = currentPartitionQueue.getFailureCause();
+
+                if (cause != null) {
+                    ctx.writeAndFlush(new NettyMessage.ErrorResponse(
+                        new ProducerFailedException(cause),
+                        currentPartitionQueue.receiverId));
+                }
+
+                currentPartitionQueue = null;
+            }
+        }
+        //buffer不为null，给予客户端响应
+        else {
+            //构建出最终的响应对象，这里就能看出，为什么要实现SequenceNumberingSubpartitionView这一包装器了
+            //因为这里用到了sequenceNumber以及receiverId
+            BufferResponse resp = 
+                new BufferResponse(buffer, currentPartitionQueue.getSequenceNumber(), 
+                currentPartitionQueue.getReceiverId());
+
+            //如果该Buffer并不是数据，而是表示子分区消费结束的事件，则会进行特殊的处理
+            if (!buffer.isBuffer() &&
+                EventSerializer.fromBuffer(buffer, 	
+                      getClass().getClassLoader()).getClass() == 
+                EndOfPartitionEvent.class) {
+
+                //通知子分区消费完成，并释放相关资源
+                currentPartitionQueue.notifySubpartitionConsumed();
+                currentPartitionQueue.releaseAllResources();
+                markAsReleased(currentPartitionQueue.getReceiverId());
+
+                currentPartitionQueue = null;
+            }
+
+            //将响应对象写入网络准备发送给请求客户端，
+            //这里就是第三个调用点中注册	ChannelFutureListener的位置了
+            //等到Netty的I/O线程处理完成后，将会触发writeAndFlushNextMessageIfPossible被再次调用
+            //从而形成了处理数据与注册回调之间的循环
+            channel.writeAndFlush(resp).addListener(writeListener);
+
+            return;
+        }
+    }
+}
+```
+
+以上就是PartitionRequestQueue的核心逻辑，它自身不是队列结构的实现，但是它内部采用队列来对用于响应数据的ResultSubpartitionView进行缓冲，从而保证了服务端的响应速度处于合适的范围。
 
 # Flink背压
 
