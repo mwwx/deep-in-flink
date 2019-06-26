@@ -4346,6 +4346,537 @@ if (channel.isWritable()) {
 
 以上就是PartitionRequestQueue的核心逻辑，它自身不是队列结构的实现，但是它内部采用队列来对用于响应数据的ResultSubpartitionView进行缓冲，从而保证了服务端的响应速度处于合适的范围。
 
+
+
+# Flink CEP复杂事件处理
+
+Flink CEP是Flink提供的复杂事件处理引擎，用作在实时数据流中识别模式。在Flink中提供了两种CEP的使用方法：DataStream API和Sql MatchRecognize语法。
+
+
+
+## 什么是NFA
+
+NFA的全称Non-determined Finite Automaton，叫做不确定的有限状态机，指的是状态有限，但是每个状态可能被转换成多个状态（不确定）。
+
+Flink CEP的实现参考了[《Efficient Pattern Matching over Event Streams》](https://people.cs.umass.edu/~yanlei/publications/sase-sigmod08.pdf)
+
+
+
+### Flink CEP的状态
+
+**从逻辑顺序上区分，Flink CEP中包含了三种类型的状态**
+
+- **Start State**
+
+  起始状态
+
+- **Middle State**
+
+  中间状态
+
+- **Final State**
+
+  结束状态
+
+**从技术实现角度Flink包含了多种状态**
+
+- Start State
+- Stop State
+- Final State
+- Normal State
+
+### 状态迁移
+
+- **Take**
+
+  表示事件匹配成功，将当前状态更新到新状态，并前进到“下一个”状态；
+
+- **Procceed**
+
+  当事件来到的时候，当前状态不发生变化，在状态转换图中事件直接“前进”到下一个目标状态；
+
+- **IGNORE**
+
+  当事件来到的时候，如果匹配不成功，忽略当前事件，当前状态不发生任何变化。
+
+## API总结
+
+**单个模式**
+
+<table>
+    <tr>
+        <td colspan="1">类型</td>
+        <td colspan="1">API</td>
+        <td colspan="10">说明</td>
+    </tr>
+    <tr>
+        <td rowspan="4">量词</td>
+        <td>times()</td>
+        <td>模式发生次数<br/>
+            示例：<br/>
+            pattern.times(2,4)，模式发生2,3,4次</td>
+    </tr>
+    <tr>
+        <td>timesOrMore（）<br/>oneOrMore()</td>
+        <td>模式发生大于等于N次<br/>
+            示例：<br/>
+            pattern.timesOrMore(2)，模式发生大于等于2次</td>
+    </tr>
+    <tr>
+        <td>optional()</td>
+        <td>模式可以不匹配 <br/>
+            示例：<br/>
+            pattern.times(2).optional()，模式发生2次或者0次</td>
+    </tr>
+    <tr>
+        <td>greedy()</td>
+        <td>贪婪模式<br/>
+            示例：<br/>
+            pattern.times(2).greedy()，模式发生2次且重复次数越多越好</td>
+    </tr>
+    <tr>
+        <td rowspan="3">条件API</td>
+        <td>where()</td>
+        <td>模式的条件<br/>
+            示例：<br/>
+            pattern.where(_.ruleId=43322)，模式的条件为ruleId=433322</td>
+    </tr>
+    <tr>
+        <td>or()</td>
+        <td>模式的或条件<br/>
+            示例：<br/>
+            pattern.where(_.ruleId=43322).or(_.ruleId=43333)，模式条件为ruleId=43322或者43333</td>
+    </tr>
+    <tr>
+        <td>until()</td>
+        <td>模式发生直至X条件满足为止<br/>
+            示例：<br/>
+            pattern.oneOrMore().util(condition)模式发生一次或者多次，直至condition满足为止</td>
+    </tr>
+</table>
+
+**组合模式**
+
+<table>
+    <tr>
+        <th colspan="1">API</td>
+        <th colspan="10">说明</td>
+    </tr>
+    <tr>
+        <td>next()</td>
+        <td>严格的满足条件<br/>
+            示例：<br/>
+			模式为begin("first").where(_.name='a').next("second").where(.name='b')<br/>
+			当且仅当数据为a,b时，模式才会被命中。如果数据为a,c,b，由于a的后面跟了c，所以a会被直接丢弃，模式不会命中。
+        </td>
+    </tr>
+    <tr>
+        <td>followedBy()</td>
+        <td>松散的满足条件<br/>
+			示例：<br/>
+			模式为begin("first").where(_.name='a').followedBy("second").where(.name='b')
+			当且仅当数据为a,b或者为a,c,b，，模式均被命中，中间的c会被忽略掉。</td>
+    </tr>
+    <tr>
+        <td>followedByAny()</td>
+        <td>非确定的松散满足条件<br/>
+			模式begin("first").where(_.name='a').followedByAny("second").where(.name='b')
+当且仅当数据为a,c,b,b时，对于followedBy模式而言命中的为{a,b}，对于followedByAny而言会有两次命中{a,b},{a,b}
+    </tr>
+    <tr>
+        <td>within()</td>
+        <td>模式命中的时间间隔限制</td>
+    </tr>
+ <tr>
+        <td>notNext()<br/>
+			notFollowedBy()</td>
+        <td>后面的模式不命中（严格/非严格）</td>
+    </tr>
+</table>
+
+**匹配完后的跳过策略**
+
+<table>
+    <tr>
+        <th colspan="1">API</td>
+        <th colspan="10">说明</td>
+    </tr>
+    <tr>
+        <td>NO_SKIP</td>
+        <td>不忽略，输出所有可能的匹配</td>
+    </tr>
+    <tr>
+        <td>SKIP_TO_NEXT</td>
+        <td>匹配完之后，跳转到匹配的下一条</td>
+    </tr>
+    <tr>
+        <td>SKIP_PAST_LAST_EVENT</td>
+        <td></td>
+    </tr>
+    <tr>
+        <td>SKIP_TO_FIRST</td>
+        <td></td>
+    </tr>
+ <tr>
+        <td>SKIP_TO_LAST</td>
+        <td></td>
+    </tr>
+</table>
+
+- **NO_SKIP**: Every possible match will be emitted.
+- **SKIP_TO_NEXT**: Discards every partial match that started with the same event, emitted match was started.
+- **SKIP_PAST_LAST_EVENT**: Discards every partial match that started after the match started but before it ended.
+- **SKIP_TO_FIRST**: Discards every partial match that started after the match started but before the first event of *PatternName*occurred.
+- **SKIP_TO_LAST**: Discards every partial match that started after the match started but before the last event of *PatternName*occurred.
+
+例如模式 b+ c，数据流 b1 b2 b3 c,匹配结果如下
+
+| 跳过策略                 | 匹配结果                      |                             说明                             |
+| :----------------------- | :---------------------------------------- | :----------------------------------------------------------: |
+| **NO_SKIP**              | b1 b2 b3 cb2 b3 c<br/> b3 c | After found matching `b1 b2 b3 c`, the match process will not discard any result. |
+| **SKIP_TO_NEXT**         | b1 b2 b3 c b2 b3 c b3 c | After found matching `b1 b2 b3 c`, the match process will not discard any result, because no other match could start at b1. |
+| **SKIP_PAST_LAST_EVENT** | `b1 b2 b3 c`                  | After found matching `b1 b2 b3 c`, the match process will discard all started partial matches. |
+| **SKIP_TO_FIRST**[`b`]   | `b1 b2 b3 c` `b2 b3 c` `b3 c` | After found matching `b1 b2 b3 c`, the match process will try to discard all partial matches started before `b1`, but there are no such matches. Therefore nothing will be discarded. |
+| **SKIP_TO_LAST**[`b`]    | `b1 b2 b3 c` `b3 c`           | After found matching `b1 b2 b3 c`, the match process will try to discard all partial matches started before `b3`. There is one such match `b2 b3 c` |
+
+## SQL MatchRecognize语法
+
+
+
+## Flink CEP的关键对象
+
+### Pattern
+
+Pattern定义对象，每个Pattern对象都会指向前序Pattern，形成一个单向Pattern链。
+
+Pattern分为一般pattern和GroupPattern。举例来说，CEP的Pattern是一个链条，如果把Pattern链视为一个Worflow工作流，叫做主工作流，那么GroupPattern就是子工作流（subflow），被当做一个工作流节点嵌入到嵌入到主工作流中。
+
+
+
+### NFA
+
+NFA的全称Non-determined Finite Automaton，叫做不确定的有限状态机，指的是状态有限，但是每个状态可能被转换成多个状态（不确定）。
+
+### SharedBuffer
+
+杜威10进制计数法。
+
+### CEPOperator
+
+在CEOOperator内部，对于KeyedStream，为每一个key维护一个NFA，Non-keyedStream维护一个全局的NFA。
+
+- 
+
+## Pattern编译
+
+### 入口
+
+使用DataStream API定义的Pattern经过NFACompiler编译之后编程NFA。
+
+```java
+public static <T> NFAFactory<T> compileFactory(
+		final Pattern<T, ?> pattern,
+		boolean timeoutHandling) {
+		if (pattern == null) {
+			// return a factory for empty NFAs
+			return new NFAFactoryImpl<>(0, Collections.<State<T>>emptyList(),
+                                        timeoutHandling);
+		} else {
+			final NFAFactoryCompiler<T> nfaFactoryCompiler = 
+                new NFAFactoryCompiler<>(pattern);
+			nfaFactoryCompiler.compileFactory();
+			return new NFAFactoryImpl<>(nfaFactoryCompiler.getWindowTime(), 
+                                        nfaFactoryCompiler.getStates(), timeoutHandling);
+		}
+	}
+```
+
+### 总体过程
+
+```java
+//NFAFactoryCompiler.java
+void compileFactory() {
+    if (currentPattern.getQuantifier().getConsumingStrategy() == 
+        Quantifier.ConsumingStrategy.NOT_FOLLOW) {
+        throw new 
+            MalformedPatternException("NotFollowedBy is not supported as a last part of a Pattern!");
+    }
+
+    checkPatternNameUniqueness();
+
+    checkPatternSkipStrategy();
+
+    // 从Final状态向前遍历依次添加状态，直至开始状态
+    //首先创建结束状态
+    State<T> sinkState = createEndingState();
+    // 添加中间状态
+    sinkState = createMiddleStates(sinkState);
+    // 添加起始状态
+    createStartState(sinkState);
+}
+```
+
+
+
+### 添加结束状态（Final State）
+
+创建结束状态比较简单，就是单纯的创建了一个State，设置StateType为State.StateType.Final
+
+```java
+private State<T> createState(String name, State.StateType stateType) {
+   String stateName = stateNameHandler.getUniqueInternalName(name);
+   State<T> state = new State<>(stateName, stateType);
+   states.add(state);
+   return state;
+}
+```
+
+
+
+### 添加中间状态（Middle State）
+
+添加中间状态是比较复杂的环节，涉及到状态以及迁移。
+
+入口如下所示：
+
+```java
+private State<T> createMiddleStates(final State<T> sinkState) {
+   State<T> lastSink = sinkState;
+   while (currentPattern.getPrevious() != null) {
+
+      if (currentPattern.getQuantifier().getConsumingStrategy() == 
+          	Quantifier.ConsumingStrategy.NOT_FOLLOW) {
+         //跳过notFollow的Pattern，notFollow的pattern被转换为NFA边的条件。
+      } else if (currentPattern.getQuantifier().getConsumingStrategy() == 
+                 Quantifier.ConsumingStrategy.NOT_NEXT) {
+          //如果是NOT_NEXT，创建Not_Next的普通State
+         final State<T> notNext = 
+             createState(currentPattern.getName(), State.StateType.Normal);
+         final IterativeCondition<T> notCondition = getTakeCondition(currentPattern);
+          //创建停止状态
+         final State<T> stopState = 
+             createStopState(notCondition, currentPattern.getName());
+		//如果lastSink State是结束状态，在NotNext和结束状态之间添加Ignore迁移边
+        //否则添加Proceed迁移边
+         if (lastSink.isFinal()) {
+            //so that the proceed to final is not fired
+            notNext.addIgnore(lastSink, new RichNotCondition<>(notCondition));
+         } else {
+            notNext.addProceed(lastSink, new RichNotCondition<>(notCondition));
+         }
+         //在Not_Next 状态和停止State之间创建Proceed迁移边
+         notNext.addProceed(stopState, notCondition);
+         lastSink = notNext;
+      } else {
+          //既不是Not_Follow也不是Not_NEXT
+         lastSink = convertPattern(lastSink);
+      }
+		
+      // we traverse the pattern graph backwards
+      followingPattern = currentPattern;
+      currentPattern = currentPattern.getPrevious();
+
+      final Time currentWindowTime = currentPattern.getWindowTime();
+      if (currentWindowTime != null && currentWindowTime.toMilliseconds() < windowTime) {
+         // the window time is the global minimum of all window times of each state
+         windowTime = currentWindowTime.toMilliseconds();
+      }
+   }
+   return lastSink;
+}
+```
+
+在convertPattern中又分为三种情况：循环、次数匹配、其他
+
+```java
+private State<T> convertPattern(final State<T> sinkState) {
+			final State<T> lastSink;
+
+			final Quantifier quantifier = currentPattern.getQuantifier();
+			if (quantifier.hasProperty(Quantifier.QuantifierProperty.LOOPING)) {
+			//循环匹配
+				// if loop has started then all notPatterns previous to the optional states are no longer valid
+				setCurrentGroupPatternFirstOfLoop(false);
+				final State<T> sink = copyWithoutTransitiveNots(sinkState);
+				final State<T> looping = createLooping(sink);
+
+				setCurrentGroupPatternFirstOfLoop(true);
+				lastSink = 
+                    createTimesState(looping, sinkState, currentPattern.getTimes());
+			} else if (quantifier.hasProperty(Quantifier.QuantifierProperty.TIMES)) {
+				//次数匹配
+                lastSink = 
+                    createTimesState(sinkState, sinkState, currentPattern.getTimes());
+			} else {
+                //其他
+				lastSink = createSingletonState(sinkState);
+			}
+			addStopStates(lastSink);
+
+			return lastSink;
+		}
+```
+
+
+
+### 创建简单的单一状态createState
+
+基础方法，创建一个State对象，为State赋予名字和类型。
+
+```java
+private State<T> createState(String name, State.StateType stateType) {
+    //为了防止State重名，跟踪使用过的名字。如果重名的话，会1个使用累加计数器在State名字后追加一个唯一编号
+    String stateName = stateNameHandler.getUniqueInternalName(name);
+    State<T> state = new State<>(stateName, stateType);
+    states.add(state);
+    return state;
+}
+```
+
+
+
+### 创建次数匹配createTimesState
+
+
+
+### 创建循环匹配createLooping
+
+循环匹配中有两种情况
+
+- GroupPattren的循环匹配
+- 一般Pattern的循环匹配
+
+
+
+```java
+/**
+ * Creates the given state as a looping one. Looping state is one with TAKE edge to itself and
+ * PROCEED edge to the sinkState. It also consists of a similar state without the PROCEED edge, so that
+ * for each PROCEED transition branches in computation state graph  can be created only once.
+ *
+ * @param sinkState the state that the converted state should point to
+ * @return the first state of the created complex state
+ * 创建循环State，循环State是一种特殊的State，带有指向自己的TAKE边和指向下一个状态的PROCEED边。
+ */
+@SuppressWarnings("unchecked")
+private State<T> createLooping(final State<T> sinkState) {
+    //如果是GroupPattern
+	if (currentPattern instanceof GroupPattern) {
+		return createLoopingGroupPatternState((GroupPattern) currentPattern, sinkState);
+	}
+    
+	final IterativeCondition<T> untilCondition = (IterativeCondition<T>) currentPattern.getUntilCondition();
+
+	final IterativeCondition<T> ignoreCondition = extendWithUntilCondition(
+		getInnerIgnoreCondition(currentPattern),
+		untilCondition,
+		false);
+	final IterativeCondition<T> takeCondition = extendWithUntilCondition(
+		getTakeCondition(currentPattern),
+		untilCondition,
+		true);
+	
+	IterativeCondition<T> proceedCondition = getTrueFunction();
+	final State<T> loopingState = createState(currentPattern.getName(), State.StateType.Normal);
+
+	if (currentPattern.getQuantifier().hasProperty(Quantifier.QuantifierProperty.GREEDY)) {
+		if (untilCondition != null) {
+			State<T> sinkStateCopy = copy(sinkState);
+			loopingState.addProceed(sinkStateCopy, new RichAndCondition<>(proceedCondition, untilCondition));
+			originalStateMap.put(sinkState.getName(), sinkStateCopy);
+		}
+		loopingState.addProceed(sinkState,
+			untilCondition != null
+				? new RichAndCondition<>(proceedCondition, new RichNotCondition<>(untilCondition))
+				: proceedCondition);
+		updateWithGreedyCondition(sinkState, getTakeCondition(currentPattern));
+	} else {
+		loopingState.addProceed(sinkState, proceedCondition);
+	}
+	loopingState.addTake(takeCondition);
+
+	addStopStateToLooping(loopingState);
+
+	if (ignoreCondition != null) {
+		final State<T> ignoreState = createState(currentPattern.getName(), State.StateType.Normal);
+		ignoreState.addTake(loopingState, takeCondition);
+		ignoreState.addIgnore(ignoreCondition);
+		loopingState.addIgnore(ignoreState, ignoreCondition);
+
+		addStopStateToLooping(ignoreState);
+	}
+	return loopingState;
+}
+```
+
+
+
+### 创建孤立匹配createSingletonState
+
+```java
+private State<T> createSingletonState(final State<T> sinkState,
+	final State<T> proceedState,
+	final IterativeCondition<T> takeCondition,
+	final IterativeCondition<T> ignoreCondition,
+	final boolean isOptional) {
+	if (currentPattern instanceof GroupPattern) {
+		return createGroupPatternState((GroupPattern) currentPattern, sinkState, proceedState, isOptional);
+	}
+	//创建State对象
+	final State<T> singletonState = createState(currentPattern.getName(), State.StateType.Normal);
+	// if event is accepted then all notPatterns previous to the optional states are no longer valid
+	final State<T> sink = copyWithoutTransitiveNots(sinkState);
+	singletonState.addTake(sink, takeCondition);
+
+	// if no element accepted the previous nots are still valid.
+	final IterativeCondition<T> proceedCondition = getTrueFunction();
+
+	// for the first state of a group pattern, its PROCEED edge should point to the following state of
+	// that group pattern and the edge will be added at the end of creating the NFA for that group pattern
+	if (isOptional && !headOfGroup(currentPattern)) {
+		if (currentPattern.getQuantifier().hasProperty(Quantifier.QuantifierProperty.GREEDY)) {
+			final IterativeCondition<T> untilCondition =
+				(IterativeCondition<T>) currentPattern.getUntilCondition();
+			if (untilCondition != null) {
+				singletonState.addProceed(
+					originalStateMap.get(proceedState.getName()),
+					new RichAndCondition<>(proceedCondition, untilCondition));
+			}
+			singletonState.addProceed(proceedState,
+				untilCondition != null
+					? new RichAndCondition<>(proceedCondition, new RichNotCondition<>(untilCondition))
+					: proceedCondition);
+		} else {
+			singletonState.addProceed(proceedState, proceedCondition);
+		}
+	}
+
+	if (ignoreCondition != null) {
+		final State<T> ignoreState;
+		if (isOptional) {
+			ignoreState = createState(currentPattern.getName(), State.StateType.Normal);
+			ignoreState.addTake(sink, takeCondition);
+			ignoreState.addIgnore(ignoreCondition);
+			addStopStates(ignoreState);
+		} else {
+			ignoreState = singletonState;
+		}
+		singletonState.addIgnore(ignoreState, ignoreCondition);
+	}
+	return singletonState;
+}
+```
+
+
+
+### GroupPattern的转换
+
+
+
+## 事件处理
+
+
+
 # Flink背压
 
 
