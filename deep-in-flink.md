@@ -115,10 +115,13 @@ Flink程序的基本构建块是流和转换。在概念上，stream 是data rec
 
 如上图所示，使用Flink DataStream API编写了一段代码，从Kafka中读取记录，逐行解析，按照id字段进行分组，然后以10秒为一个窗口统计自定义的统计逻辑，最后将每个窗口的输出结果输出到滚动循环的1个文件中。
 
+Flink首先将DataStream API的调用转换为StreamGraph和JobGraph，将JobGraph提交给Flink集群。
+
 
 
 ![img](./images/code-run2.svg)
-[上图解释说明]
+
+Flink集群收到客户端提交的JobGraph，将JobGraph转换为ExecutionGraph，根据并行度，创建ExecutionGraph中的执行单元，最终调度到TaskManager真正的执行。
 
 # Flink类型与序列化系统
 
@@ -127,6 +130,8 @@ Flink程序的基本构建块是流和转换。在概念上，stream 是data rec
 ### Flink类型分类
 
 ![img](./images/flink-type-system.png)
+
+
 
 ### Flink类型Class
 
@@ -1876,7 +1881,7 @@ JobGraph 之上除了 StreamGraph 还有 OptimizedPlan。OptimizedPlan 是由 Ba
 
 ### FlinkStreaming 4层图结构
 
-![img](https://upload-images.jianshu.io/upload_images/5501600-416016b40d269ab8.png?imageMogr2/auto-orient/)
+![img](images/5501600-416016b40d269ab8.png)
 
 - **StreamGraph**
 
@@ -4948,7 +4953,241 @@ private State<T> createSingletonState(final State<T> sinkState,
 
 
 
-## 事件处理
+# Flink Table & SQL
+
+## Table & SQL API编程
+
+### Table & SQL编程的一般代码结构
+
+```scala
+// 获取流计算的环境，批处理使用 ExecutionEnvironment
+val env = StreamExecutionEnvironment.getExecutionEnvironment
+
+// 创建 TableEnvironment
+val tableEnv = TableEnvironment.getTableEnvironment(env)
+
+// 注册 Table，用作输入或者输出
+tableEnv.registerTable("table1", fieldNames, fieldTypes, csvSource)
+
+// Table API查询结构
+val tapiResult = tableEnv.scan("table1").select(...)
+
+// SQL 语句查询接口
+val sqlResult  = tableEnv.sqlQuery("SELECT ... FROM table2 ...")
+
+// 输出查询结果到外部存储，例如kafka、hdfs、DB等
+tapiResult.writeToSink(...)
+
+// 触发执行
+env.execute()
+```
+
+
+
+> ```scala
+> 
+> 
+> // 获取流计算的环境，批处理使用 ExecutionEnvironment
+> val env = StreamExecutionEnvironment.getExecutionEnvironment
+> 
+> // 创建 TableEnvironment
+> val tableEnv = TableEnvironment.getTableEnvironment(env)
+> 
+> /**
+> 
+> - 定义数据表，如果有多个数据源、数据的输出，则需要每一个都要像如下定义
+>   */
+>   val csvSource: TableSource = new CsvTableSource("/path/to/file", ...)
+>   // 定义Table的字段类型
+>   val fieldNames: Array[String] = Array("a", "b", "c")
+>   val fieldTypes: Array[TypeInformation[_]] = Array(Types.INT, Types.STRING, Types.LONG)
+>   // 注册 Table，用作输入或者输出
+>   tableEnv.registerTable("table1", fieldNames, fieldTypes, csvSource)
+>   ......
+> 
+> // Table API查询结构
+> val tapiResult = tableEnv.scan("table1").select(...)
+> 
+> // SQL 语句查询接口
+> val sqlResult  = tableEnv.sqlQuery("SELECT ... FROM table2 ...")
+> 
+> // 输出查询结果到外部存储，例如kafka、hdfs、DB等
+> tapiResult.writeToSink(...)
+> 
+> // 触发执行
+> env.execute()
+> ```
+>
+> 
+
+## Calcite介绍
+
+​		[Apache Calcite](https://links.jianshu.com/go?to=https%3A%2F%2Fcalcite.apache.org%2F) 是一个动态数据管理框架，它具备很多典型数据库管理系统的功能，比如SQL解析、SQL校验、SQL查询优化、SQL生成以及数据连接查询等，但是又省略了一些关键的功能，比如Calcite并不存储相关的元数据和基本数据，不完全包含相关处理数据的算法等。
+
+​		Calcite 的设计目标是成为[动态的数据管理框架](http://calcite.incubator.apache.org/docs/index.html)，所以在具有很多特性的同时，它也舍弃了一些功能，比如数据存储、处理数据的算法和元数据仓库。由于舍弃了这些功能，Calcite 可以在应用和数据存储、数据处理引擎之间很好地扮演中介的角色。用 Calcite 创建数据库非常灵活，你只需要动态地添加数据即可。 
+
+​		Calcite 使用了基于关系代数的查询引擎，聚焦在关系代数的语法分析和查询逻辑的规划制定上。它不受上层编程语言的限制，前端可以使用 SQL、Pig、Cascading 或者 Scalding，只要通过 Calcite 提供的SQL  API（解析、验证等） 将它们转化成关系代数的抽象语法树即可。并根据一定的规则或成本对AST的算法与关系进行优化，最后推给各个数据处理引擎进行执行。
+
+​		Calcite 也不涉及物理规划层，它通过扩展适配器来连接多种后端的数据源和处理引擎，如 Spark、Splunk、HBase、Cassandra 或者 MangoDB。简单的说，这种架构就是“一种查询引擎，[连接多种前端和后端](http://calcite.incubator.apache.org/docs/adapter.html)”。目前，使用Calcite作为SQL解析与优化引擎的又Hive、Drill、Flink、Phoenix和Storm。
+
+### 为什么需要一个SQL相关的语法解析和优化库？
+
+​			首先，从一个计算框架的研发者视角来看。SQL语法解析背后需要对关系代数的深刻理解，本身存在一定技术门槛，而且需要保证SQL解析的结果与ANSI-SQL等主流SQL流派的语义一致，还是需要下不少功夫的。而更重要的是，尤其在大数据量的分布式计算场景，一条SQL可以parse为多颗语义对等的语法叔，但彼此间的执行效率可能相差甚远，且在不同的数据结构、量级和计算逻辑上，优劣选择也不同。
+
+​		于是，如何优化就成为一个很重要且需要长期积累c。这两个方面，在分布式批量计算、流式计算、交互式查询等领域，都或多或少的存在共性，尤其是当把优化算法抽象为可插拔的Rules之后，就更加可能孵化出一个通用的框架来。
+
+​		其次，从数据分析的视角看，需要整合多个计算框架，很可能需要跨平台的查询分发和优化,例如异构数据库的关联，如何方便的集成不同的数据源就是一个复杂的工作，如果能够有一个框架提供平台无关的数据处理的方式，数据分析人员不需要关心集成的细节，只需要编写通用的SQL即可，无疑会极大的降低数据分析的门槛。
+
+### Calcite的主要功能
+
+Calcite的主要功能如下
+
+- **SQL解析**
+
+  Calcite的SQL解析是通过JavaCC实现的，使用JavaCC编写SQL语法描述文件，将SQL解析成未经校验的AST语法树。
+
+- **SQL校验**
+
+  校验分两部分：
+
+  ​		1、无状态的校验，即验证SQL语句是否符合规范；
+
+  ​		2、有状态的即通过与元数据结合验证SQL中的Schema、Field、Function是否存在，输入输出类型是否匹配等。
+
+- **SQL查询优化**
+
+  对上个步骤的输出（RelNode，逻辑计划树）进行优化，得到优化后的物理执行计划。优化有两种：1、基于规则的优化，2、基于代价的优化，后边会详细介绍。
+
+- **SQL生成**
+
+  将物理执行计划生成为在特定平台/引擎的可执行程序，如生成符合Mysql or Oracle等不同平台规则的SQL查询语句等
+
+- **~~数据连接与执行~~**
+
+  通过各个执行平台执行查询，得到输出结果。
+
+  
+
+​		在Flink或者其他的使用Calcite的大数据引擎中，一般到SQL查询优化即结束，由各个平台将优化后的物理执行计划，结合Calcite的SQL代码生成和平台自己实现的代码生成，组合成可执行的代码，然后在内存中编译执行。
+
+#### 代码示例--功能展示
+
+```java
+// 初始化配置
+SqlParser.ConfigBuilder configBuilder = SqlParser.configBuilder();
+configBuilder.setUnquotedCasing(Casing.UNCHANGED);
+//Sql解析：解析Sql语句，通过JavaCC解析成AST语法树，表现为SqlNode
+SqlParser sqlParser = SqlParser.create(sql, configBuilder.build());
+SqlNode sqlNode = sqlParser.parseQuery();
+//Sql校验：结合元数据信息验证Sql是否符合规范
+Planner planner = Frameworks.getPlanner(config);
+SqlNode node = planner.validate(sqlNode);
+//Sql查询优化：将SqlNode转换为LogicalPlan，表现为RelNode
+RelRoot relRoot = planner.rel(node);
+RelNode project = relRoot.project();
+//指定优化规则，使用的是基于规则的优化器
+final HepProgram program = new HepProgramBuilder() 
+    .addRuleInstance(SubQueryRemoveRule.PROJECT)
+    .addRuleInstance(SubQueryRemoveRule.FILTER)
+    .addRuleInstance(SubQueryRemoveRule.JOIN)
+    .build();
+//生成优化后的RelNode
+HepPlanner prePlanner = new HepPlanner(program);
+prePlanner.setRoot(project);
+RelNode relNode = prePlanner.findBestExp();
+//ToDo 执行查询 
+```
+
+### 技术特点
+
+**主要技术特点**
+
+- 支持标准SQL语言；
+- 独立于编程语言和数据源，可以支持不同的前端和后端
+- 支持关系代数、可定制的逻辑规划规则和基于成本模型优化的查询引擎
+- 支持物化视图（materialized view）的管理（创建、丢弃、持久化和自动识别）
+- 基于物化视图的Lattice和Tile机制，以应用于OLAP分析；
+- 支持对流数据的查询 
+
+**其他特点**
+
+- 跨数据源查询
+- Calcite本身会缓存Schema、Function等信息（我们目前没用到，自己在内存里缓存的）
+  支持复合指标计算(a+b as c)、常用聚合函数(sum、count、distinct)、sort、group by、join、limit等 
+- 架构比较精简，利用Calcite写几百行代码就可以实现一个SQL查询方案；
+- 灵活绑定优化规则，对于一个条件，我们可以自定义多个优化规则，只要命中，可以根据不同的规则多次优化同一个查询条件 
+
+### 目标
+
+Calcite 的设计目标是成为[动态的数据管理框架](http://calcite.incubator.apache.org/docs/index.html)，所以在具有很多特性的同时，它也舍弃了一些功能，比如数据存储、处理数据的算法和元数据仓库。由于舍弃了这些功能，Calcite 可以在应用和数据存储、数据处理引擎之间很好地扮演中介的角色。用 Calcite 创建数据库非常灵活，你只需要动态地添加数据即可。 
+
+同时，Calcite 使用了基于关系代数的查询引擎，聚焦在关系代数的语法分析和查询逻辑的规划制定上。它不受上层编程语言的限制，前端可以使用 SQL、Pig、Cascading 或者 Scalding，只要通过 Calcite 提供的 API 将它们转化成关系代数的抽象语法树即可。 
+
+同时，Calcite 也不涉及物理规划层，它通过扩展适配器来连接多种后端的数据源和处理引擎，如 Spark、Splunk、HBase、Cassandra 或者 MangoDB。简单的说，这种架构就是“一种查询引擎，[连接多种前端和后端](http://calcite.incubator.apache.org/docs/adapter.html)”。
+
+### 核心原理
+
+关系代数是关系型数据库操作的理论基础，关系代数支持并、差、笛卡尔积、投影和选择等基本运算。[关系代数](http://calcite.incubator.apache.org/docs/algebra.html#adding-a-filter-and-aggregate)是 Calcite 的核心，任何一个查询都可以表示成由关系运算符组成的树。 可以将 SQL 转换成关系代数，或者通过 Calcite 提供的 API 直接创建它。比如下面这段 SQL 查询： 
+
+```sql
+SELECT deptno, count(*) AS c, sum(sal) AS s
+FROM emp
+GROUP BY deptno
+HAVING count(*) > 10
+```
+
+可以表达成如下的关系表达式语法树： 
+
+```java
+LogicalFilter(condition=[>($1, 10)])
+  LogicalAggregate(group=[{7}], C=[COUNT()], S=[SUM($5)])
+    LogicalTableScan(table=[[scott, EMP]])
+```
+
+当上层编程语言，如 SQL 转换为关系表达式后，就会被送到 Calcite 的逻辑规划器进行规则匹配。在这个过程中，Calcite 查询引擎会循环使用规划规则对关系表达式语法树的节点和子图进行优化。这种优化过程会以一个成本模型作为参考，每次优化都在保证语义的情况下利用规则来降低成本，成本主要以查询时间最快、资源消耗最少这些维度去度量。 
+
+使用逻辑规划规则等同于数学恒等式变换，比如将一个过滤器推到内连接（inner join）输入的内部执行，当然使用这个规则的前提是过滤器不会引用内连接输入之外的数据列。如下图所示，将 Filter 操作下推到 Join 下面的示例，这样做的好处是减少 Join 操作记录的数量。
+
+![img](images/a0011186ec607810d3a87577acc79bb6.png)
+
+​		Calcite 提供了灵活的机制，可以根据需要，自定义关系运算符、规划规则、成本模型和相关的统计，从而进行不同的取舍，适应于各种场景，这也是Calcite作为框架的初衷。
+
+## Flink与Calcite关系
+
+![1561539147692](images/1561539147692.png)
+
+Table API与Batch&StreamingSQL（以下简称Sql）在底层的处理上是相同的，差别在与上层的处理过程，Table API利用了Calcite RelBuilder直接生成了Calcite的Logical Plan Tree，Sql的方式则是通过
+
+​		**SqlParse解析**-->**生成Calcite SqlNode Tree**-->**validator校验sql语法**-->**生成Calcite Logical Plan**
+
+至此Table API和Sql完成了统一，表达形式为Table。
+
+> **Calcite Catalog**
+>
+> catalog存储表的元信息，包含表名、字段、字段类型以及其他信息。Flink的Table API和SQL校验的时候回根据元信息进行校验，例如在sql或者Table API中使用的表、列名是否是存在的。
+>
+> **Calcite Optimizer**
+>
+> 在Flink中调用了**StreamTableEnvironment**中的**optimize**方法用来进行优化
+
+### 从Logical Plan到 DataStream&DataSet程序
+
+![1561540194747](images/1561540194747.png)
+
+调用Table API 实际上是创建了很多 Table API 的 LogicalNode，创建的过程中对会对整个query进行validate。比如table是CalalogNode，window groupBy之后在select时会创建WindowAggregate和Project，where对应Filter。然后用RelBuilder翻译成Calcite LogicalPlan。如果是SQL API将直接用Calcite的Parser进行解释然后validate生成Calcite LogicalPlan。
+
+利用Calcite内置的一些rule来优化LogicalPlan，也可以自己添加或者覆盖这些rule。转换成Optimized Calcite Plan后，仍然是Calcite的内部表示方式，现在需要transform成DataStream Plan，对应上图第三列的类，里面封装了如何translate成普通的DataStream或DataSet程序。随后调用相应的tanslateToPlan方法转换和利用CodeGen元编程成Flink的各种算子。现在就相当于我们直接利用Flink的DataSet或DataStream API开发的程序。
+
+### SQL Query的执行过程
+
+```mermaid
+graph TB
+sql_parse[1.sql parser] --> sql_validate[2.Sql Validator] 
+sql_validate -->create_logical_plan[3.生成Logical Plan]
+create_logical_plan --> optimize_logical_plan[4.生成优化的Logical Plan]
+optimize_logical_plan --> physical_plan[5.生成Flink Physical Plan]
+physical_plan --> execute_plan[6.生成Execution Plan]
+```
 
 
 
