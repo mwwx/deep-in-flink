@@ -4631,11 +4631,48 @@ Pattern定义对象，每个Pattern对象都会指向前序Pattern，形成一�
 
 Pattern分为一般pattern和GroupPattern。举例来说，CEP的Pattern是一个链条，如果把Pattern链视为一个Worflow工作流，叫做主工作流，那么GroupPattern就是子工作流（subflow），被当做一个工作流节点嵌入到嵌入到主工作流中。
 
+**Pattern的关键属性**
+
+```java
+//模式名
+private final String name;
+
+//前序Pattern,组成Pattern模式链
+private final Pattern<T, ? extends T> previous;
+
+/** 模式的命中条件 */
+private IterativeCondition<F> condition;
+
+/**模式匹配的时间限制，例如必须是10分钟之内发生的匹配才算匹配成功 */
+private Time windowTime;
+/** 模式匹配的修饰符，严格匹配与非严格匹配，一般匹配与NOT匹配，匹配次数、是否贪婪匹配都在此对象中表达*/
+private Quantifier quantifier = Quantifier.one(ConsumingStrategy.STRICT);
+
+/** The condition an event has to satisfy to stop collecting events into looping state. */
+private IterativeCondition<F> untilCondition;
+/**模式的匹配次数，例如*/
+private Times times;
+//匹配成功或失败之后的跳过策略
+private final AfterMatchSkipStrategy afterMatchSkipStrategy;
+```
+
 
 
 ### NFA
 
 NFA的全称Non-determined Finite Automaton，叫做不确定的有限状态机，指的是状态有限，但是每个状态可能被转换成多个状态（不确定）。
+
+**NFA的关键属性**
+
+```java
+/**NFACompiler编译之后的合法Pattern，用在CEPOperator的事件处理中*/
+private final Map<String, State<T>> states;
+
+/**匹配的时间限制*/
+private final long windowTime;
+```
+
+
 
 ### SharedBuffer
 
@@ -4950,6 +4987,39 @@ private State<T> createSingletonState(final State<T> sinkState,
 
 
 ### GroupPattern的转换
+
+将GroupPattern转换为State与上下游的Pattern连接起来，在执行层面上是没有GroupPattern的概念，只有State和State之间的迁移。
+
+```java
+private State<T> createGroupPatternState(
+	final GroupPattern<T, ?> groupPattern,
+	final State<T> sinkState,
+	final State<T> proceedState,
+	final boolean isOptional) {
+	final IterativeCondition<T> proceedCondition = getTrueFunction();
+
+	Pattern<T, ?> oldCurrentPattern = currentPattern;
+	Pattern<T, ?> oldFollowingPattern = followingPattern;
+	GroupPattern<T, ?> oldGroupPattern = currentGroupPattern;
+
+	State<T> lastSink = sinkState;
+	currentGroupPattern = groupPattern;
+	currentPattern = groupPattern.getRawPattern();
+	lastSink = createMiddleStates(lastSink);
+	lastSink = convertPattern(lastSink);
+	if (isOptional) {
+		// for the first state of a group pattern, its PROCEED edge should point to
+		// the following state of that group pattern
+		lastSink.addProceed(proceedState, proceedCondition);
+	}
+	currentPattern = oldCurrentPattern;
+	followingPattern = oldFollowingPattern;
+	currentGroupPattern = oldGroupPattern;
+	return lastSink;
+}
+```
+
+
 
 
 
